@@ -727,12 +727,21 @@ class BaseAlgorithm(ABC):
             if "env" in data:
                 env = data["env"]
 
-        model = cls(
-            policy=data["policy_class"],
-            env=env,
-            device=device,
-            _init_setup_model=False,  # type: ignore[call-arg]
-        )
+        if "diffusion_act_dim" in custom_objects.keys():
+            model = cls(
+                policy=data["policy_class"],
+                env=env,
+                device=device,
+                _init_setup_model=False,  # type: ignore[call-arg]
+                diffusion_act_dim=custom_objects["diffusion_act_dim"]
+            )
+        else:
+            model = cls(
+                policy=data["policy_class"],
+                env=env,
+                device=device,
+                _init_setup_model=False,  # type: ignore[call-arg]
+            )
 
         # load parameters
         model.__dict__.update(data)
@@ -759,25 +768,32 @@ class BaseAlgorithm(ABC):
             else:
                 raise e
         except ValueError as e:
-            # Patch to load DQN policies saved using SB3 < 2.4.0
-            # The target network params are no longer in the optimizer
-            # See https://github.com/DLR-RM/stable-baselines3/pull/1963
-            saved_optim_params = params["policy.optimizer"]["param_groups"][0]["params"]  # type: ignore[index]
-            n_params_saved = len(saved_optim_params)
-            n_params = len(model.policy.optimizer.param_groups[0]["params"])
-            if n_params_saved == 2 * n_params:
-                # Truncate to include only online network params
-                params["policy.optimizer"]["param_groups"][0]["params"] = saved_optim_params[:n_params]  # type: ignore[index]
+            if "policy.optimizer" in params:
+                # Patch to load DQN policies saved using SB3 < 2.4.0
+                # The target network params are no longer in the optimizer
+                # See https://github.com/DLR-RM/stable-baselines3/pull/1963
+                saved_optim_params = params["policy.optimizer"]["param_groups"][0]["params"]  # type: ignore[index]
+                n_params_saved = len(saved_optim_params)
+                n_params = len(model.policy.optimizer.param_groups[0]["params"])
+                if n_params_saved == 2 * n_params:
+                    # Truncate to include only online network params
+                    params["policy.optimizer"]["param_groups"][0]["params"] = saved_optim_params[:n_params]  # type: ignore[index]
 
-                model.set_parameters(params, exact_match=True, device=device)
-                warnings.warn(
-                    "You are probably loading a DQN model saved with SB3 < 2.4.0, "
-                    "we truncated the optimizer state so you can save the model "
-                    "again to avoid issues in the future "
-                    "(see https://github.com/DLR-RM/stable-baselines3/pull/1963 for more info). "
-                    f"Original error: {e} \n"
-                    "Note: the model should still work fine, this only a warning."
-                )
+                    model.set_parameters(params, exact_match=True, device=device)
+                    warnings.warn(
+                        "You are probably loading a DQN model saved with SB3 < 2.4.0, "
+                        "we truncated the optimizer state so you can save the model "
+                        "again to avoid issues in the future "
+                        "(see https://github.com/DLR-RM/stable-baselines3/pull/1963 for more info). "
+                        f"Original error: {e} \n"
+                        "Note: the model should still work fine, this only a warning."
+                    )
+                else:
+                    warnings.warn(
+                        "No 'policy.optimizer' found in saved parameters. "
+                        "This is expected for older checkpoints. Skipping loading optimizer state."
+                    )
+                    model.set_parameters(params, exact_match=False, device=device)
             else:
                 raise e
 

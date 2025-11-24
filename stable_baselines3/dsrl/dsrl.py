@@ -1,7 +1,7 @@
 from typing import Any, ClassVar, Optional, TypeVar, Union
 
 import numpy as np
-import torch as th
+import torch
 from gymnasium import spaces
 from torch.nn import functional as F
 
@@ -78,7 +78,7 @@ class DSRL(OffPolicyAlgorithm):
 	:param critic_backup_combine_type: How to combine the critics for the backup (min or mean)
 	"""
 	policy_aliases: ClassVar[dict[str, type[BasePolicy]]] = {
-		"MlpPolicy": MlpPolicy,
+		"MlpPolicy": MlpPolicy,	# MlpPolicy == SACPolicy
 		"CnnPolicy": CnnPolicy,
 		"MultiInputPolicy": MultiInputPolicy,
 	}
@@ -115,7 +115,7 @@ class DSRL(OffPolicyAlgorithm):
 		policy_kwargs: Optional[dict[str, Any]] = None,
 		verbose: int = 0,
 		seed: Optional[int] = None,
-		device: Union[th.device, str] = "auto",
+		device: Union[torch.device, str] = "auto",
 		_init_setup_model: bool = True,
 		actor_gradient_steps: int = -1,
 		diffusion_policy=None,
@@ -152,12 +152,12 @@ class DSRL(OffPolicyAlgorithm):
 		)
 
 		self.target_entropy = target_entropy
-		self.log_ent_coef = None  # type: Optional[th.Tensor]
+		self.log_ent_coef = None  # type: Optional[torch.Tensor]
 		# Entropy coefficient / Entropy temperature
 		# Inverse of the reward scale
 		self.ent_coef = ent_coef
 		self.target_update_interval = target_update_interval
-		self.ent_coef_optimizer: Optional[th.optim.Adam] = None
+		self.ent_coef_optimizer: Optional[torch.optim.Adam] = None
 		self.actor_gradient_steps = actor_gradient_steps
 		
 		self.diffusion_policy = diffusion_policy
@@ -171,14 +171,16 @@ class DSRL(OffPolicyAlgorithm):
 
 	def _setup_model(self) -> None:
 		super()._setup_model()
-		self._create_aliases()
+		self._create_aliases()	# (gaoyuan) all policy / actor refer to noise space
+
 		# Running mean and running var
 		self.batch_norm_stats = get_parameters_by_name(self.critic, ["running_"])
 		self.batch_norm_stats_target = get_parameters_by_name(self.critic_target, ["running_"])
+
 		# Target entropy is used when learning the entropy coefficient
 		if self.target_entropy == "auto":
 			# automatically set target entropy if needed
-			self.target_entropy = float(-np.prod(self.env.action_space.shape).astype(np.float32))  # type: ignore
+			self.target_entropy = float(-np.prod(self.env.action_space.shape).astype(np.float32))
 		else:
 			# Force conversion
 			# this will also throw an error for unexpected string
@@ -196,22 +198,22 @@ class DSRL(OffPolicyAlgorithm):
 
 			# Note: we optimize the log of the entropy coeff which is slightly different from the paper
 			# as discussed in https://github.com/rail-berkeley/softlearning/issues/37
-			self.log_ent_coef = th.log(th.ones(1, device=self.device) * init_value).requires_grad_(True)
-			self.ent_coef_optimizer = th.optim.Adam([self.log_ent_coef], lr=self.lr_schedule(1))
+			self.log_ent_coef = torch.log(torch.ones(1, device=self.device) * init_value).requires_grad_(True)
+			self.ent_coef_optimizer = torch.optim.Adam([self.log_ent_coef], lr=self.lr_schedule(1))
 		else:
 			# Force conversion to float
 			# this will throw an error if a malformed string (different from 'auto')
 			# is passed
-			self.ent_coef_tensor = th.tensor(float(self.ent_coef), device=self.device)
+			self.ent_coef_tensor = torch.tensor(float(self.ent_coef), device=self.device)
 		
-		policy_noise = self.policy_class(
+		policy_noise = self.policy_class(	# SACPolicy
 			self.observation_space,
 			self.action_space,
 			self.lr_schedule,
 			**self.policy_kwargs,
 		)
-		self.critic_noise = policy_noise.critic
-		self.critic_noise = self.critic_noise.to(self.device)
+		self.critic_noise = policy_noise.critic		# (gaoyuan) only get critic part
+		self.critic_noise: ContinuousCritic = self.critic_noise.to(self.device)		# Q_w(s, a) in noise space
 
 	def _create_aliases(self) -> None:
 		self.actor = self.policy.actor
@@ -240,7 +242,8 @@ class DSRL(OffPolicyAlgorithm):
 
 		for gradient_step in range(gradient_steps):
 			# Sample replay buffer
-			replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)  # type: ignore[union-attr]
+			# (gaoyuan) `replay_data.actions` stores actual action in env but not sampled noise
+			replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
 
 			# We need to sample because `log_std` may have changed between two gradient steps
 			if self.use_sde:
@@ -255,7 +258,7 @@ class DSRL(OffPolicyAlgorithm):
 				# Important: detach the variable from the graph
 				# so we don't change it with other losses
 				# see https://github.com/rail-berkeley/softlearning/issues/60
-				ent_coef = th.exp(self.log_ent_coef.detach())
+				ent_coef = torch.exp(self.log_ent_coef.detach())
 				ent_coef_loss = -(self.log_ent_coef * (log_prob + self.target_entropy).detach()).mean()
 				ent_coef_losses.append(ent_coef_loss.item())
 			else:
@@ -263,25 +266,30 @@ class DSRL(OffPolicyAlgorithm):
 
 			ent_coefs.append(ent_coef.item())
 
-			# Optimize entropy coefficient, also called
-			# entropy temperature or alpha in the paper
+			# Optimize entropy coefficient, also called entropy temperature or alpha in the paper
 			if ent_coef_loss is not None and self.ent_coef_optimizer is not None:
 				self.ent_coef_optimizer.zero_grad()
 				ent_coef_loss.backward()
 				self.ent_coef_optimizer.step()
 
-			with th.no_grad():
+			with torch.no_grad():
 				# Select action according to policy
 				next_actions, next_log_prob = self.actor.action_log_prob(replay_data.next_observations)
-				next_actions = th.tensor(self.policy.unscale_action(next_actions.cpu().numpy())).to(self.device)
-				next_actions = self.diffusion_policy(replay_data.next_observations, next_actions.reshape(-1, self.diffusion_act_chunk, self.diffusion_act_dim), return_numpy=False)
+				next_actions = torch.tensor(self.policy.unscale_action(next_actions.cpu().numpy())).to(self.device)
+				next_actions = self.diffusion_policy(	# (gaoyuan) DP: (real_obs, noise) -> real_action
+					replay_data.next_observations, 
+					next_actions.reshape(-1, self.diffusion_act_chunk, self.diffusion_act_dim), 
+					return_numpy=False
+				)
 				next_actions = next_actions.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim)
+
 				# Compute the next Q values: min over all critics targets
-				next_q_values = th.cat(self.critic_target(replay_data.next_observations, next_actions), dim=1)
+				# (gaoyuan) here Q is in real physical world
+				next_q_values = torch.cat(self.critic_target(replay_data.next_observations, next_actions), dim=1)
 				if self.critic_backup_combine_type == 'min':
-					next_q_values, _ = th.min(next_q_values, dim=1, keepdim=True)
+					next_q_values, _ = torch.min(next_q_values, dim=1, keepdim=True)
 				elif self.critic_backup_combine_type == 'mean':
-					next_q_values = th.mean(next_q_values, dim=1, keepdim=True)
+					next_q_values = torch.mean(next_q_values, dim=1, keepdim=True)
 				# add entropy term
 				next_q_values = next_q_values - ent_coef * next_log_prob.reshape(-1, 1)
 				# td error + entropy term
@@ -291,9 +299,9 @@ class DSRL(OffPolicyAlgorithm):
 			# using action from the replay buffer
 			current_q_values = self.critic(replay_data.observations, replay_data.actions)
 
-			# Compute critic loss
+			# Compute critic loss: in real-world Q_A(s, a)
 			critic_loss = 0.5 * sum(F.mse_loss(current_q, target_q_values) for current_q in current_q_values)
-			assert isinstance(critic_loss, th.Tensor)  # for type checker
+			assert isinstance(critic_loss, torch.Tensor)  # for type checker
 			critic_losses.append(critic_loss.item())  # type: ignore[union-attr]
 
 			# Optimize the critic
@@ -303,13 +311,13 @@ class DSRL(OffPolicyAlgorithm):
 
 			if gradient_step in actor_gradient_idx:
 				# Compute actor loss
-				# Alternative: actor_loss = th.mean(log_prob - qf1_pi)
+				# Alternative: actor_loss = torch.mean(log_prob - qf1_pi)
 				# Min over all critic networks
-				q_values_pi = th.cat(self.critic_noise(replay_data.observations, actions_pi), dim=1)
+				q_values_pi = torch.cat(self.critic_noise(replay_data.observations, actions_pi), dim=1)
 				if self.critic_backup_combine_type == 'min':
-					min_qf_pi, _ = th.min(q_values_pi, dim=1, keepdim=True)
+					min_qf_pi, _ = torch.min(q_values_pi, dim=1, keepdim=True)
 				elif self.critic_backup_combine_type == 'mean':
-					min_qf_pi = th.mean(q_values_pi, dim=1, keepdim=True)
+					min_qf_pi = torch.mean(q_values_pi, dim=1, keepdim=True)
 				actor_loss = (ent_coef * log_prob - min_qf_pi).mean()
 				actor_losses.append(actor_loss.item())
 
@@ -324,6 +332,7 @@ class DSRL(OffPolicyAlgorithm):
 				# Copy running stats, see GH issue #996
 				polyak_update(self.batch_norm_stats, self.batch_norm_stats_target, 1.0)
 
+		# (gaoyuan) distillation, for `noise_critic` in noise space
 		for gradient_step in range(self.noise_critic_grad_steps):
 			# Sample replay buffer
 			critic_distill_loss = 0
@@ -345,23 +354,28 @@ class DSRL(OffPolicyAlgorithm):
 		if len(ent_coef_losses) > 0:
 			self.logger.record("train/ent_coef_loss", np.mean(ent_coef_losses))
 
-
 	def update_noise_critic(self, replay_data):
-		with th.no_grad():
-			noise_actions = th.randn(replay_data.actions.shape[0], self.diffusion_act_chunk, self.diffusion_act_dim).to(self.device)
+		with torch.no_grad():
+			noise_actions = torch.randn(	# [B, chunk_size, action_dim]
+				replay_data.actions.shape[0], 
+				self.diffusion_act_chunk, 
+				self.diffusion_act_dim
+			).to(self.device)
 			diffused_actions = self.diffusion_policy(replay_data.observations, noise_actions, return_numpy=False)
 			diffused_actions = diffused_actions.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim)
 			current_q_values = self.critic(replay_data.observations, diffused_actions)
+
+		# NOTE(gaoyuan) 
 		noise_actions = noise_actions.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim).detach().cpu().numpy()
-		noise_actions = th.tensor(self.policy.scale_action(noise_actions)).to(self.device)
+		noise_actions = torch.tensor(self.policy.scale_action(noise_actions)).to(self.device)
 		current_q_noise_vals = self.critic_noise(replay_data.observations, noise_actions)
 		critic_distill_loss = 0
+		
 		for i in range(len(current_q_values)):
 			current_q = current_q_values[i]
 			current_q_noise = current_q_noise_vals[i]
-			critic_distill_loss = critic_distill_loss + 0.5*F.mse_loss(current_q.detach(), current_q_noise)
+			critic_distill_loss = critic_distill_loss + 0.5 * F.mse_loss(current_q.detach(), current_q_noise)
 		return critic_distill_loss
-
 
 	def learn(
 		self: SelfDSRL,
@@ -416,6 +430,7 @@ class DSRL(OffPolicyAlgorithm):
 			The two differs when the action space is not normalized (bounds are not [-1, 1]).
 		"""
 		# Select action randomly or according to policy
+		# (gaoyuan) directly sample action in real-world
 		if self.num_timesteps < learning_starts and not (self.use_sde and self.use_sde_at_warmup):
 			# Warmup phase
 			unscaled_action = np.array([self.action_space.sample() for _ in range(n_envs)])
@@ -432,7 +447,7 @@ class DSRL(OffPolicyAlgorithm):
 
 			# Add noise to the action (improve exploration)
 			if action_noise is not None:
-				scaled_action = np.clip(scaled_action + action_noise(), -1, 1)
+				scaled_action = np.clip(scaled_action + action_noise(), -1, 1)	# NOTE: here we clip the action!
 
 			# We store the scaled action in the buffer
 			buffer_action = scaled_action
@@ -441,8 +456,10 @@ class DSRL(OffPolicyAlgorithm):
 			# Discrete case, no need to normalize or clip
 			buffer_action = unscaled_action
 			action = buffer_action
-		action = th.as_tensor(action, device=self.device, dtype=th.float32)
-		obs = th.as_tensor(self._last_obs, device=self.device, dtype=th.float32)
+
+		action: torch.Tensor = torch.as_tensor(action, device=self.device, dtype=torch.float32)
+		obs = torch.as_tensor(self._last_obs, device=self.device, dtype=torch.float32)
+
 		action = self.diffusion_policy(obs, action.reshape(-1, self.diffusion_act_chunk, self.diffusion_act_dim), return_numpy=False)
 		action = action.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim)
 		action = action.cpu().numpy()
@@ -456,6 +473,9 @@ class DSRL(OffPolicyAlgorithm):
 		episode_start: Optional[np.ndarray] = None,
 		deterministic: bool = False,
 	) -> tuple[np.ndarray, Optional[tuple[np.ndarray, ...]]]:
+		"""(gaoyuan)
+		Given an observation, predict `action_noise`, scale and unscale, then pass through DP to get real action
+		"""
 		unscaled_action, predict_second_return = self.policy.predict(observation, state, episode_start, deterministic)
 		if isinstance(self.action_space, spaces.Box):
 			scaled_action = self.policy.scale_action(unscaled_action)
@@ -466,8 +486,9 @@ class DSRL(OffPolicyAlgorithm):
 			# Discrete case, no need to normalize or clip
 			buffer_action = unscaled_action
 			action = buffer_action
-		action = th.as_tensor(action, device=self.device, dtype=th.float32)
-		obs = th.as_tensor(observation, device=self.device, dtype=th.float32)
+
+		action = torch.as_tensor(action, device=self.device, dtype=torch.float32)
+		obs = torch.as_tensor(observation, device=self.device, dtype=torch.float32)
 		action = self.diffusion_policy(obs, action.reshape(-1, self.diffusion_act_chunk, self.diffusion_act_dim), return_numpy=False)
 		action = action.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim)
 		action = action.cpu().numpy()
