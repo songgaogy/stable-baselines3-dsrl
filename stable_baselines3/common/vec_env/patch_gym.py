@@ -24,10 +24,10 @@ def _patch_env(env: Union["gym.Env", gymnasium.Env]) -> gymnasium.Env:  # pragma
 	:param env: A gym/gymnasium env
 	:return: Patched env (gymnasium env)
 	"""
-	print(f"env class: {env.__class__}")
-	print(f"gymnasium.Env class: {gymnasium.Env}")
-	print(f"MRO: {env.__class__.__mro__}")
-	print(f"Is instance: {isinstance(env, gymnasium.Env)}")
+	# print(f"env class: {env.__class__}")
+	# print(f"gymnasium.Env class: {gymnasium.Env}")
+	# print(f"MRO: {env.__class__.__mro__}")
+	# print(f"Is instance: {isinstance(env, gymnasium.Env)}")
 
 	# Gymnasium env, no patching to be done
 	if isinstance(env, gymnasium.Env):
