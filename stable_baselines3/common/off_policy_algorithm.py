@@ -196,6 +196,25 @@ class OffPolicyAlgorithm(BaseAlgorithm):
                 **replay_buffer_kwargs,
             )
 
+        # (gaoyuan) added
+        if getattr(self, "succ_buffer", None) is None:
+            succ_kwargs = getattr(self, "succ_buffer_kwargs", {}).copy()
+            succ_buffer_size = self.buffer_size
+
+            if issubclass(self.replay_buffer_class, HerReplayBuffer):
+                succ_kwargs["env"] = self.env
+
+            self.succ_buffer = self.replay_buffer_class(
+                succ_buffer_size,
+                self.observation_space,
+                self.action_space,
+                device=self.device,
+                n_envs=self.n_envs,
+                optimize_memory_usage=self.optimize_memory_usage,
+                **succ_kwargs,
+            )
+            print("success buffer init")
+
         self.policy = self.policy_class(
             self.observation_space,
             self.action_space,
@@ -302,7 +321,7 @@ class OffPolicyAlgorithm(BaseAlgorithm):
             progress_bar,
         )
 
-    def learn(
+    def  learn(
         self: SelfOffPolicyAlgorithm,
         total_timesteps: int,
         callback: MaybeCallback = None,

@@ -52,7 +52,7 @@ class ReplayBufferSamples(NamedTuple):
     next_observations: th.Tensor
     dones: th.Tensor
     rewards: th.Tensor
-    noise_actions: th.Tensor        # NOTE(gaoyuan) add here, delete this when running original dsrl
+    # noise_actions: th.Tensor        # NOTE(gaoyuan) add here, delete this when running original dsrl
 
 
 class DictReplayBufferSamples(NamedTuple):

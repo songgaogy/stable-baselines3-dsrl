@@ -553,3 +553,12 @@ def get_system_info(print_info: bool = True) -> tuple[dict[str, str], str]:
     if print_info:
         print(env_info_str)
     return env_info, env_info_str
+
+
+
+def expectile_loss(diff: th.Tensor, expectile: float) -> th.Tensor:
+	"""
+	IQL Expectile Loss: L = |tau - I(diff < 0)| * diff^2
+	"""
+	weight = th.where(diff > 0, expectile, (1 - expectile))
+	return th.mean(weight * (diff ** 2))

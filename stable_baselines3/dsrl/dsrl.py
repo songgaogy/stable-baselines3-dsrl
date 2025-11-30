@@ -387,7 +387,7 @@ class DSRL(OffPolicyAlgorithm):
 		progress_bar: bool = False,
 	) -> SelfDSRL:
 		return super().learn(
-			total_timesteps=total_timesteps,
+			total_timesteps=total_timesteps,	# 1000000
 			callback=callback,
 			log_interval=log_interval,
 			tb_log_name=tb_log_name,
