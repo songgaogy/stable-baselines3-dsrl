@@ -313,7 +313,7 @@ class FLOW(OffPolicyAlgorithm):
             # BC for policys
             self.policy_pos.set_training_mode(True)
             self.policy_neg.set_training_mode(True)
-            self._train_bc_step(buffer=self.replay_buffer, batch_size=self.batch_size)
+            self._train_bc_step(buffer=self.succ_buffer, batch_size=self.batch_size)
             self.policy_pos.set_training_mode(False)
             self.policy_neg.set_training_mode(False)
 
