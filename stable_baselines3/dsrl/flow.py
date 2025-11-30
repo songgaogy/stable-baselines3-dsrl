@@ -313,14 +313,14 @@ class FLOW(OffPolicyAlgorithm):
             # BC for policys
             self.policy_pos.set_training_mode(True)
             self.policy_neg.set_training_mode(True)
-            self._train_bc_step(buffer=self.succ_buffer, batch_size=self.batch_size)
+            self._train_bc_step(buffer=self.replay_buffer, batch_size=self.batch_size)
             self.policy_pos.set_training_mode(False)
             self.policy_neg.set_training_mode(False)
 
             # IQL for Q and V
             self.critic.set_training_mode(True)
             self.value.train(True)
-            self._train_qv_iql_step(buffer=self.succ_buffer, batch_size=self.batch_size)
+            self._train_qv_iql_step(buffer=self.replay_buffer, batch_size=self.batch_size)
             self.critic.set_training_mode(False)
             self.value.train(False)
             
@@ -372,14 +372,14 @@ class FLOW(OffPolicyAlgorithm):
             self.critic.set_training_mode(True)
             self.value.train(True)
             self.policy.set_training_mode(False)
-            self._train_qv_iql_step(buffer=self.succ_buffer, batch_size=self.batch_size)
+            self._train_qv_iql_step(buffer=self.replay_buffer, batch_size=self.batch_size)
             
             # dual policy updates
             self.critic.set_training_mode(False)
             self.value.train(False)
             self.policy_pos.set_training_mode(True)
             self.policy_neg.set_training_mode(True)
-            self._train_dual_net_step(buffer=self.succ_buffer, batch_size=self.batch_size)
+            self._train_dual_net_step(buffer=self.replay_buffer, batch_size=self.batch_size)
 
             # Update counters
             self.num_timesteps += 1
