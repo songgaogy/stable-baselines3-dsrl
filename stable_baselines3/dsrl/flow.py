@@ -59,8 +59,6 @@ class FLOW(OffPolicyAlgorithm):
         temperature: float = 3.0,
         policy_eta: float = 1.0,
         critic_eta: float = 0.1,
-        guidance_w: float = 0.5,
-        beta: float = 1.0,
         tensorboard_log: Optional[str] = None,
         policy_kwargs: Optional[dict[str, Any]] = None,
         verbose: int = 0,
@@ -107,10 +105,6 @@ class FLOW(OffPolicyAlgorithm):
         self.policy_eta = policy_eta
         self.critic_eta = critic_eta
 
-        # for flow_2nets
-        self.beta = beta
-        self.guidance_w = guidance_w
-
         self.max_episode_steps = max_episode_steps
         self.env_buffers = None
         self.submission_staging = None
@@ -123,23 +117,22 @@ class FLOW(OffPolicyAlgorithm):
     def _setup_model(self) -> None:
         super(FLOW, self)._setup_model()
         
-        self.policy_pos = self.policy_class(
+        self.policy = self.policy_class(
             self.observation_space,
             self.action_space,
             self.cfg.lr_schedule,
             **self.policy_kwargs,
         ).to(self.device)
-        
-        self.policy_neg = self.policy_class(
-            self.observation_space,
-            self.action_space,
-            self.cfg.lr_schedule,
-            **self.policy_kwargs,
-        ).to(self.device)
+        assert isinstance(self.policy, FlowPolicy)
+        self.actor = self.policy
 
-        # for stable_baseline3 compability
-        self.policy = self.policy_pos
-        self.actor = self.policy_pos
+        self.policy_old = copy.deepcopy(self.policy)
+        
+        # freeze policy_old and set to eval mode
+        self.policy_old.set_training_mode(False)
+        self.policy_old.to(self.device)
+        for param in self.policy_old.parameters():
+            param.requires_grad = False
 
         features_extractor = self.policy.features_extractor if hasattr(self.policy, "features_extractor") else None
         
@@ -165,8 +158,7 @@ class FLOW(OffPolicyAlgorithm):
             hidden_dim=256
         ).to(self.device)
 
-        self.policy_pos_optimizer = torch.optim.Adam(self.policy_pos.parameters(), lr=1e-4)
-        self.policy_neg_optimizer = torch.optim.Adam(self.policy_neg.parameters(), lr=1e-4)
+        self.policy_optimizer = torch.optim.Adam(self.policy.parameters(), lr=1e-4)
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=1e-4)
         self.value_optimizer = torch.optim.Adam(self.value.parameters(), lr=1e-4)
         
@@ -288,7 +280,7 @@ class FLOW(OffPolicyAlgorithm):
         self: SelfFLOW,
         iterations: int,
         callback: MaybeCallback = None,
-        log_interval: int = 100,
+        log_interval: int = 200,
         tb_log_name: str = "flow-nft",
         reset_num_timesteps: bool = True,
         progress_bar: bool = False,
@@ -310,12 +302,10 @@ class FLOW(OffPolicyAlgorithm):
         print(f"[INFO] eval freq: {self.eval_freq}")
 
         while self.num_timesteps < total_timesteps:
-            # BC for policys
-            self.policy_pos.set_training_mode(True)
-            self.policy_neg.set_training_mode(True)
-            self._train_bc_step(buffer=self.replay_buffer, batch_size=self.batch_size)
-            self.policy_pos.set_training_mode(False)
-            self.policy_neg.set_training_mode(False)
+            # BC for policy
+            self.policy.set_training_mode(True)
+            self._train_bc_step(buffer=self.succ_buffer, batch_size=self.batch_size)
+            self.policy.set_training_mode(False)
 
             # IQL for Q and V
             self.critic.set_training_mode(True)
@@ -328,6 +318,7 @@ class FLOW(OffPolicyAlgorithm):
             self._n_updates += 1
 
             if self.num_timesteps % log_interval == 0:
+                self.logger.record("global_step", self.num_timesteps)
                 self.logger.record("eval/global_step", self.num_timesteps)
                 self.logger.record("train/global_step", self.num_timesteps)
                 self._dump_logs()
@@ -345,7 +336,7 @@ class FLOW(OffPolicyAlgorithm):
         self: SelfFLOW,
         iterations: int, # NOTE: This refers to gradient steps in offline RL
         callback: MaybeCallback = None,
-        log_interval: int = 100,
+        log_interval: int = 10,
         tb_log_name: str = "flow-nft",
         reset_num_timesteps: bool = False, # False to continue from BC
         progress_bar: bool = False,
@@ -360,7 +351,7 @@ class FLOW(OffPolicyAlgorithm):
             iterations, 
             callback, 
             reset_num_timesteps,    # do not reset, but continue
-            tb_log_name=tb_log_name,
+            tb_log_name=tb_log_name, 
             progress_bar=progress_bar
         )
         callback.on_training_start(locals(), globals())
@@ -368,18 +359,17 @@ class FLOW(OffPolicyAlgorithm):
         print(f"[INFO] eval freq: {eval_freq}")
 
         while self.num_timesteps < total_timesteps:
-            # perform IQL updates first to get accurate Advantage
+            # We perform IQL updates first to get accurate Advantage
             self.critic.set_training_mode(True)
             self.value.train(True)
             self.policy.set_training_mode(False)
             self._train_qv_iql_step(buffer=self.replay_buffer, batch_size=self.batch_size)
             
-            # dual policy updates
+            # Update Policy (NFT)
             self.critic.set_training_mode(False)
             self.value.train(False)
-            self.policy_pos.set_training_mode(True)
-            self.policy_neg.set_training_mode(True)
-            self._train_dual_net_step(buffer=self.replay_buffer, batch_size=self.batch_size)
+            self.policy.set_training_mode(True)
+            self._train_nft_step(buffer=self.replay_buffer, batch_size=self.batch_size)
 
             # Update counters
             self.num_timesteps += 1
@@ -387,6 +377,7 @@ class FLOW(OffPolicyAlgorithm):
 
             # Logging
             if self.num_timesteps % log_interval == 0:
+                self.logger.record("global_step", self.num_timesteps)
                 self.logger.record("eval/global_step", self.num_timesteps)
                 self.logger.record("train/global_step", self.num_timesteps)
                 self._dump_logs()
@@ -411,31 +402,23 @@ class FLOW(OffPolicyAlgorithm):
         assert len(actions.shape) == 2, f"actions in replay buffer has no expected shape, with shape of: {actions.shape}"
         target_actions = actions.view(batch_size, self.policy.chunk_length, self.policy.act_dim).to(self.device)
 
+        # Flow Matching Loss Logic
         x_1 = target_actions
         x_0 = torch.randn_like(x_1, device=self.device)
         t = torch.rand(batch_size, device=self.device)
         t_expand = t.view(batch_size, 1, 1) if x_1.dim() == 3 else t.view(batch_size, 1)
+        
         x_t = (1 - t_expand) * x_0 + t_expand * x_1
         v_target = x_1 - x_0
-
-        # Update Policy Pos
-        v_pred_pos = self.policy_pos(obs, x_t, t)
-        loss_pos = F.mse_loss(v_pred_pos, v_target)
-
-        self.policy_pos_optimizer.zero_grad()
-        loss_pos.backward()
-        self.policy_pos_optimizer.step()
-
-        # Update Policy Neg
-        v_pred_neg = self.policy_neg(obs, x_t, t)
-        loss_neg = F.mse_loss(v_pred_neg, v_target)
         
-        self.policy_neg_optimizer.zero_grad()
-        loss_neg.backward()
-        self.policy_neg_optimizer.step()
+        v_pred = self.policy(obs, x_t, t)
+        loss = F.mse_loss(v_pred, v_target)
 
-        self.logger.record("train/bc_loss_pos", loss_pos.item())
-        self.logger.record("train/bc_loss_neg", loss_neg.item())
+        self.policy_optimizer.zero_grad()
+        loss.backward()
+        self.policy_optimizer.step()
+
+        self.logger.record("train/policy_bc_loss", loss.item())
 
     def _train_qv_iql_step(self, buffer: ReplayBuffer, batch_size: int) -> None:
         """
@@ -481,7 +464,7 @@ class FLOW(OffPolicyAlgorithm):
         self.logger.record("train/critic_loss", critic_loss.item())
         self.logger.record("train/v_pred_mean", v_pred.mean().item())
 
-    def _train_dual_net_step(self, buffer: ReplayBuffer, batch_size: int, nft_beta: float = 1.0) -> None:
+    def _train_nft_step(self, buffer: ReplayBuffer, batch_size: int, nft_beta: float = 1.0) -> None:
         """
         Single gradient step for NFT
         """
@@ -503,44 +486,49 @@ class FLOW(OffPolicyAlgorithm):
             normalized_advantage = (advantage - adv_mean) / (adv_std + 1e-8)
             
             # weights for NFT
-            weights_pos = torch.sigmoid(self.beta * normalized_advantage)
-            weights_neg = 1.0 - weights_pos
+            weights = torch.sigmoid(normalized_advantage * self.temperature)
         
         # Flow Matching Setup
-        x_1 = actions.view(batch_size, self.policy_pos.chunk_length, self.policy_pos.act_dim)
-        
+        # TODO(gaoyuan) check this
+        x_1 = actions.view(batch_size, self.policy.chunk_length, self.policy.act_dim)
         # Expand weights to match action dims [B, 1, 1]
-        weights_pos_exp = weights_pos.view(batch_size, 1, 1)
-        weights_neg_exp = weights_neg.view(batch_size, 1, 1)
+        weights_expand = weights.view(batch_size, 1, 1)
 
         x_0 = torch.randn_like(x_1)
         t = torch.rand(batch_size, device=self.device)
         t_expand = t.view(batch_size, 1, 1) if x_1.dim() == 3 else t.view(batch_size, 1)
 
         x_t = (1.0 - t_expand) * x_0 + t_expand * x_1
-        v_target = x_1 - x_0
+        target_v = x_1 - x_0
 
-        # Update Positive Policy (theta_1)
-        v_pred_pos = self.policy_pos(obs, x_t, t)
-        loss_pos = torch.mean(weights_pos_exp * (v_pred_pos - v_target)**2)
+        # Get old policy prediction (no grad)
+        with torch.no_grad():
+            old_v = self.policy_old(obs, x_t, t)
         
-        self.policy_pos_optimizer.zero_grad()
-        loss_pos.backward()
-        self.policy_pos_optimizer.step()
+        pred_v = self.policy(obs, x_t, t)   # Get current policy prediction (grad)
 
-        # Update Negative Policy (theta_2)
-        v_pred_neg = self.policy_neg(obs, x_t, t)
-        loss_neg = torch.mean(weights_neg_exp * (v_pred_neg - v_target)**2)
+        # Positive and Negative flow terms
+        positive_v = (1.0 - nft_beta) * old_v + nft_beta * pred_v
+        negative_v = (1.0 + nft_beta) * old_v - nft_beta * pred_v
+        
+        loss_pos = torch.mean(weights_expand * (positive_v - target_v)**2)
+        loss_neg = torch.mean(weights_expand * (negative_v - target_v)**2)
+        actor_loss = loss_pos + loss_neg
 
-        self.policy_neg_optimizer.zero_grad()
-        loss_neg.backward()
-        self.policy_neg_optimizer.step()
+        self.policy_optimizer.zero_grad()
+        actor_loss.backward()
+        self.policy_optimizer.step()
 
-        self.logger.record("train/dual_loss_pos", loss_pos.item())
-        self.logger.record("train/dual_loss_neg", loss_neg.item())
+        # implement ema update
+        polyak_update(self.policy.parameters(), self.policy_old.parameters(), self.policy_eta)
+
+        self.logger.record("train/nft_actor_loss", actor_loss.item())
+        self.logger.record("train/nft_pos_loss", loss_pos.item())
+        self.logger.record("train/nft_neg_loss", loss_neg.item())
         self.logger.record("train/advantage_mean", adv_mean.item())
         self.logger.record("train/normalized_adv", normalized_advantage.mean().item())
-        self.logger.record("train/weight_pos_mean", weights_pos.mean().item())
+        self.logger.record("train/weights: sig(norm_A*temp)", weights.mean().item())
+        self.logger.record("train/ema_eta", self.policy_eta)
 
     def predict(
         self,
@@ -548,58 +536,39 @@ class FLOW(OffPolicyAlgorithm):
         episode_start: Optional[np.ndarray] = None,
         deterministic: bool = False,
     ) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, ...]]]:
-        """
-        Sampling according to papers
-        """
         assert self.device.type == 'cuda', f"Device Assertion Failed: Expected 'cuda', but got '{self.device}'."
-        
-        # Ensure eval mode
-        self.policy_pos.set_training_mode(False)
-        self.policy_neg.set_training_mode(False)
-        
-        observation, vectorized_env = self.policy_pos.obs_to_tensor(observation)
+        self.policy.to(self.device)
+
+        self.policy.set_training_mode(False)
+        observation, vectorized_env = self.policy.obs_to_tensor(observation)
         batch_size = observation.shape[0]
 
         with torch.no_grad():
             x = torch.randn(
                 batch_size,
-                self.policy_pos.chunk_length, 
-                self.policy_pos.act_dim,
+                self.policy.chunk_length, 
+                self.policy.act_dim,
                 device=self.device,
             )
             
             num_steps = self.cfg.flow_steps
             dt = 1.0 / num_steps
-            w = self.guidance_w
             
             for i in range(num_steps):
                 t_val = i * dt
                 t_tensor = torch.full((batch_size,), t_val, device=self.device)
                 
-                v_pos = self.policy_pos(observation, x, t_tensor)
-                v_neg = self.policy_neg(observation, x, t_tensor)
-                
-                # according to papers
-                v_pred = (1 + w) * v_pos - w * v_neg
-                
+                v_pred = self.policy(observation, x, t_tensor)
                 x = x + v_pred * dt
 
-            action = x.reshape(-1, self.policy_pos.chunk_length * self.policy_pos.act_dim)
+            action = x.reshape(-1, self.policy.chunk_length * self.policy.act_dim)
             action = action.cpu().numpy()
 
         if isinstance(self.action_space, spaces.Box):
+            # clip based on environment bounds, not arbitrary -1,1
             action = np.clip(action, self.action_space.low, self.action_space.high)
 
         return action
 
     def _get_torch_save_params(self) -> Tuple[List[str], List[str]]:
-        return [
-            "policy_pos", 
-            "policy_neg", 
-            "critic", 
-            "value", 
-            "policy_pos_optimizer", 
-            "policy_neg_optimizer", 
-            "critic_optimizer", 
-            "value_optimizer"
-        ], []
+        return ["policy", "critic", "value", "policy_old", "policy_optimizer", "critic_optimizer", "value_optimizer"], []
