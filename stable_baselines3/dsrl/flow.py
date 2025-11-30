@@ -280,7 +280,7 @@ class FLOW(OffPolicyAlgorithm):
         self: SelfFLOW,
         iterations: int,
         callback: MaybeCallback = None,
-        log_interval: int = 200,
+        log_interval: int = 100,
         tb_log_name: str = "flow-nft",
         reset_num_timesteps: bool = True,
         progress_bar: bool = False,
@@ -318,7 +318,8 @@ class FLOW(OffPolicyAlgorithm):
             self._n_updates += 1
 
             if self.num_timesteps % log_interval == 0:
-                self.logger.record("global_step", self.num_timesteps)
+                self.logger.record("eval/global_step", self.num_timesteps)
+                self.logger.record("train/global_step", self.num_timesteps)
                 self._dump_logs()
             
             # Callback (Evaluation / Checkpointing)
@@ -334,7 +335,7 @@ class FLOW(OffPolicyAlgorithm):
         self: SelfFLOW,
         iterations: int, # NOTE: This refers to gradient steps in offline RL
         callback: MaybeCallback = None,
-        log_interval: int = 10,
+        log_interval: int = 100,
         tb_log_name: str = "flow-nft",
         reset_num_timesteps: bool = False, # False to continue from BC
         progress_bar: bool = False,
@@ -349,7 +350,7 @@ class FLOW(OffPolicyAlgorithm):
             iterations, 
             callback, 
             reset_num_timesteps,    # do not reset, but continue
-            tb_log_name=tb_log_name, 
+            tb_log_name=tb_log_name,
             progress_bar=progress_bar
         )
         callback.on_training_start(locals(), globals())
@@ -375,7 +376,8 @@ class FLOW(OffPolicyAlgorithm):
 
             # Logging
             if self.num_timesteps % log_interval == 0:
-                self.logger.record("global_step", self.num_timesteps)
+                self.logger.record("eval/global_step", self.num_timesteps)
+                self.logger.record("train/global_step", self.num_timesteps)
                 self._dump_logs()
 
             # Callback (Evaluation / Checkpointing)
