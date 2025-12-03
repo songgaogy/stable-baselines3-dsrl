@@ -59,9 +59,10 @@ class FLOW(OffPolicyAlgorithm):
         temperature: float = 3.0,
         policy_eta: float = 1.0,
         critic_eta: float = 0.1,
-        guidance_w: float = 0.5,
+        guidance_w: List[float] = [0.0, 1.0],
         beta: float = 1.0,
         bc_buffer: str = "success",
+        discount: float = 0.99, 
         tensorboard_log: Optional[str] = None,
         policy_kwargs: Optional[dict[str, Any]] = None,
         verbose: int = 0,
@@ -84,7 +85,7 @@ class FLOW(OffPolicyAlgorithm):
             learning_starts=learning_starts,
             batch_size=batch_size,
             tau=0.005,      # redundant
-            gamma=0.99,
+            gamma=discount,
             train_freq=train_freq,
             gradient_steps=gradient_steps,
             action_noise=action_noise,
@@ -112,6 +113,7 @@ class FLOW(OffPolicyAlgorithm):
         self.beta = beta
         self.guidance_w = guidance_w
         self.bc_buffer = bc_buffer
+        self.discount = discount
 
         self.max_episode_steps = max_episode_steps
         self.env_buffers = None
@@ -505,22 +507,19 @@ class FLOW(OffPolicyAlgorithm):
         replay_data = buffer.sample(batch_size, env=self._vec_normalize_env)
         obs = replay_data.observations
         actions = replay_data.actions
+        next_obs = replay_data.next_observations
 
         # advantage
         with torch.no_grad():
-            # NOTE(gaoyuan) actions are flattened
-            target_q1, target_q2 = self.critic_target(obs, actions)
-            target_q = torch.min(target_q1, target_q2)
-            target_val = self.value(obs)
-            advantage = target_q - target_val
+            # Calculate V_current and V_next
+            v_current = self.value(obs)
+            v_next = self.value(next_obs)
             
-            # normalize advantage 
-            adv_mean = advantage.mean()
-            adv_std = advantage.std()
-            normalized_advantage = (advantage - adv_mean) / (adv_std + 1e-8)
+            # (gaoyuan) follow the instruction of ZhiHao :)
+            guidance_term = (2.0 - self.discount) * v_next - v_current
             
             # weights for NFT
-            weights_pos = torch.sigmoid(self.beta * normalized_advantage)
+            weights_pos = torch.sigmoid(guidance_term)
             weights_neg = 1.0 - weights_pos
         
         # Flow Matching Setup
@@ -555,15 +554,16 @@ class FLOW(OffPolicyAlgorithm):
 
         self.logger.record("train/dual_loss_pos", loss_pos.item())
         self.logger.record("train/dual_loss_neg", loss_neg.item())
-        self.logger.record("train/advantage_mean", adv_mean.item())
-        self.logger.record("train/normalized_adv", normalized_advantage.mean().item())
+        self.logger.record("train/G_mean", guidance_term.mean().item())
         self.logger.record("train/weight_pos_mean", weights_pos.mean().item())
+        self.logger.record("train/weight_neg_mean", weights_neg.mean().item())
 
     def predict(
         self,
         observation: Union[np.ndarray, Dict[str, np.ndarray]],
         episode_start: Optional[np.ndarray] = None,
         deterministic: bool = False,
+        w: float = 1.0
     ) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, ...]]]:
         """
         Sampling according to papers
@@ -587,7 +587,6 @@ class FLOW(OffPolicyAlgorithm):
             
             num_steps = self.cfg.flow_steps
             dt = 1.0 / num_steps
-            w = self.guidance_w
             
             for i in range(num_steps):
                 t_val = i * dt
