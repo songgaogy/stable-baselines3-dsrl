@@ -61,13 +61,14 @@ class FLOW(OffPolicyAlgorithm):
         critic_eta: float = 0.1,
         guidance_w: float = 0.5,
         beta: float = 1.0,
+        bc_buffer: str = "success",
         tensorboard_log: Optional[str] = None,
         policy_kwargs: Optional[dict[str, Any]] = None,
         verbose: int = 0,
         seed: Optional[int] = None,
         device: Union[torch.device, str] = "auto",
         _init_setup_model: bool = True,
-        max_episode_steps: int = 400
+        max_episode_steps: int = 400,
     ):
         self.cfg = FlowConfig()
 
@@ -107,9 +108,10 @@ class FLOW(OffPolicyAlgorithm):
         self.policy_eta = policy_eta
         self.critic_eta = critic_eta
 
-        # for flow_2nets
+        # for dipole
         self.beta = beta
         self.guidance_w = guidance_w
+        self.bc_buffer = bc_buffer
 
         self.max_episode_steps = max_episode_steps
         self.env_buffers = None
@@ -217,6 +219,9 @@ class FLOW(OffPolicyAlgorithm):
         directory: Union[str, pathlib.Path],
         target_buffer: ReplayBuffer,
         prefix: str = "success_data",
+        size: int = 2000,
+        use_01_reward: bool = False,
+        reward_offset: int = 1,
         truncate_last_traj: bool = True,
         verbose: int = 1,
     ) -> None:
@@ -265,13 +270,20 @@ class FLOW(OffPolicyAlgorithm):
             # Match device to current setting
             loaded_buffer.device = self.device
 
+            # for 0/1 reward
+            success_threshold = -reward_offset
+
             # Append transitions from loaded_buffer into target_buffer
             n_transitions = loaded_buffer.size()
-            for idx in range(n_transitions):
+            assert size <= 5000
+            load_transitions = int(size / 5000 * n_transitions)
+            for idx in range(load_transitions):
                 obs = loaded_buffer.observations[idx]
                 next_obs = loaded_buffer.next_observations[idx]
                 actions = loaded_buffer.actions[idx]
                 rewards = loaded_buffer.rewards[idx]
+                if use_01_reward:   # convert to 0/1 reward: 1 if reward > threshold, else 0
+                    rewards = (rewards > success_threshold).astype(rewards.dtype)
                 dones = loaded_buffer.dones[idx]
                 infos = [{} for _ in range(self.n_envs)]
 
@@ -289,7 +301,7 @@ class FLOW(OffPolicyAlgorithm):
         iterations: int,
         callback: MaybeCallback = None,
         log_interval: int = 100,
-        tb_log_name: str = "flow-nft",
+        tb_log_name: str = "dipole",
         reset_num_timesteps: bool = True,
         progress_bar: bool = False,
     ) -> SelfFLOW:
@@ -313,7 +325,12 @@ class FLOW(OffPolicyAlgorithm):
             # BC for policys
             self.policy_pos.set_training_mode(True)
             self.policy_neg.set_training_mode(True)
-            self._train_bc_step(buffer=self.succ_buffer, batch_size=self.batch_size)
+            if self.bc_buffer == "success":
+                self._train_bc_step(buffer=self.succ_buffer, batch_size=self.batch_size)
+            elif self.bc_buffer == "all":
+                self._train_bc_step(buffer=self.replay_buffer, batch_size=self.batch_size)
+            else:
+                raise NotImplementedError("invalid buffer type!")
             self.policy_pos.set_training_mode(False)
             self.policy_neg.set_training_mode(False)
 
@@ -346,7 +363,7 @@ class FLOW(OffPolicyAlgorithm):
         iterations: int, # NOTE: This refers to gradient steps in offline RL
         callback: MaybeCallback = None,
         log_interval: int = 100,
-        tb_log_name: str = "flow-nft",
+        tb_log_name: str = "dipole",
         reset_num_timesteps: bool = False, # False to continue from BC
         progress_bar: bool = False,
     ) -> SelfFLOW:
@@ -364,7 +381,7 @@ class FLOW(OffPolicyAlgorithm):
             progress_bar=progress_bar
         )
         callback.on_training_start(locals(), globals())
-        print(f"[FLOW] Starting NFT Phase for {iterations} steps...")
+        print(f"[FLOW] Starting DIPOLE Phase for {iterations} steps...")
         print(f"[INFO] eval freq: {eval_freq}")
 
         while self.num_timesteps < total_timesteps:
