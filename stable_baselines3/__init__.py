@@ -33,6 +33,7 @@ __all__ = [
     "DSRL",
     "DSRL_Flow",
     "FLOW",
+    "Clean_IQL",
     "TD3",
     "HerReplayBuffer",
     "get_system_info",

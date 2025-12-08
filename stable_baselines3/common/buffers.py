@@ -124,7 +124,27 @@ class BaseBuffer(ABC):
         else:
             prob = np.ones(self.pos) / self.pos
         prob = prob / prob.sum()
-        batch_inds = np.random.choice(np.arange(upper_bound).astype(int), p=prob, size=batch_size)
+
+        try:
+            # original code
+            batch_inds = np.random.choice(np.arange(upper_bound).astype(int), p=prob, size=batch_size)
+        except ValueError as e:
+            print("\n" + "="*30)
+            print(f"!!! DEBUG: capture shape mismatch !!!")
+            print(f"Error: {e}")
+            print(f"1. buffer size 'a' (upper_bound): {upper_bound}")
+            
+            if 'prob' in locals():
+                print(f"2. prob size 'p' (len(prob)):  {len(prob)}")
+            else:
+                print("2. prob table 'prob' does not exist")
+                
+            print(f"3. Buffer size (buffer_size):   {self.buffer_size}")
+            print(f"4. Buffer current pointer (pos):       {self.pos}")
+            print(f"5. Buffer is full (full):      {self.full}")
+            print("="*30 + "\n")
+            raise e
+
         # batch_inds = np.random.randint(0, upper_bound, size=batch_size)
         return self._get_samples(batch_inds, env=env)
     
