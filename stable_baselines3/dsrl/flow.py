@@ -60,6 +60,7 @@ class FLOW(OffPolicyAlgorithm):
         policy_eta: float = 1.0,
         critic_eta: float = 0.1,
         guidance_w: List[float] = [0.0, 1.0],
+        best_of_n: List[int] = [1, 2, 4],
         beta: float = 1.0,
         bc_buffer: str = "success",
         discount: float = 0.99, 
@@ -114,6 +115,7 @@ class FLOW(OffPolicyAlgorithm):
         self.guidance_w = guidance_w
         self.bc_buffer = bc_buffer
         self.discount = discount
+        self.best_of_n = best_of_n
 
         self.max_episode_steps = max_episode_steps
         self.env_buffers = None
