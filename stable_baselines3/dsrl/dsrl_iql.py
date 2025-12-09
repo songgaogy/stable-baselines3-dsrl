@@ -473,28 +473,33 @@ class Clean_IQL(OffPolicyAlgorithm):
         **kwargs,
     ) -> "Clean_IQL":
         """
-        Load the model.
+        Load the model from a zip/pkl file.
         """
-        data, params, pytorch_variables = load_from_pkl(path, verbose=False)
+        # (gaoyuan) Fix: `save` method only saves a dict, not a tuple
+        # So we must check what load_from_pkl returns.
+        loaded_object = load_from_pkl(path, verbose=False)
+
+        # Standard SB3 saves (data, params, pytorch_variables)
+        # But this custom class saved only `data` (dict)
+        if isinstance(loaded_object, dict):
+            data = loaded_object
+            params = None
+            pytorch_variables = None
+        elif isinstance(loaded_object, tuple):
+             # Try to unpack if it matched standard format
+             data, params, pytorch_variables = loaded_object[:3]
+        else:
+            raise ValueError(f"Unknown format loaded from {path}: {type(loaded_object)}")
 
         model = cls(env=env, device=device, _init_setup_model=True, **kwargs)
-        
-        # Load Critics and Value
         model.critic.load_state_dict(data["critic_state_dict"])
         model.critic_target.load_state_dict(data["critic_target_state_dict"])
         model.value.load_state_dict(data["value_state_dict"])
         
-        # Load Policy
-        if "policy_state_dict" in data:
-            model.policy.load_state_dict(data["policy_state_dict"])
-        
-        # Load Optimizers
         if "critic_optimizer_state_dict" in data:
             model.critic_optimizer.load_state_dict(data["critic_optimizer_state_dict"])
         if "value_optimizer_state_dict" in data:
             model.value_optimizer.load_state_dict(data["value_optimizer_state_dict"])
-        if "policy_optimizer_state_dict" in data and hasattr(model.policy, "optimizer"):
-            model.policy_optimizer.load_state_dict(data["policy_optimizer_state_dict"])
 
         print(f"[Clean_IQL] Model loaded from {path}")
         return model
