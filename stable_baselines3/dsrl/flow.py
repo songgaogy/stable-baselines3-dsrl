@@ -35,7 +35,7 @@ class FLOW(OffPolicyAlgorithm):
     
     Phases:
     1. BC Phase (`learn_bc_iql`): Updates policy using Behavior Cloning.
-    2. NFT Phase (`learn`): Updates Q/V (IQL) and Policy (NFT/Advantage).
+    2. Dipole Phase (`learn`): Updates Q/V (IQL) and Policy (NFT/Advantage).
     """
     policy: FlowPolicy
     policy_old: FlowPolicy
