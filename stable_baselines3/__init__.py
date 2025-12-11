@@ -7,7 +7,7 @@ from stable_baselines3.dqn import DQN
 from stable_baselines3.her.her_replay_buffer import HerReplayBuffer
 from stable_baselines3.ppo import PPO
 from stable_baselines3.sac import SAC
-from stable_baselines3.dsrl import DSRL, DSRL_Flow, FLOW
+from stable_baselines3.dsrl import DSRL, DSRL_Flow, FLOW, NFTOnline
 from stable_baselines3.dsrl import DSRL_Flow
 from stable_baselines3.td3 import TD3
 
@@ -32,6 +32,7 @@ __all__ = [
     "SAC",
     "DSRL",
     "DSRL_Flow",
+    "NFTOnline"
     "FLOW",
     "TD3",
     "HerReplayBuffer",
