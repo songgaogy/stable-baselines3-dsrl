@@ -4,7 +4,8 @@ import copy
 import numpy as np
 import torch
 import pathlib
-import tqdm
+from tqdm import tqdm
+from omegaconf import ListConfig
 from gymnasium import spaces
 import torch.nn as nn
 from torch.nn import functional as F
@@ -70,8 +71,9 @@ class NFTOnline(OffPolicyAlgorithm):
         _init_setup_model: bool = True,
         max_episode_steps: int = 400,
         steps_per_iter: int = 10000,
-        collecting_ratio: float = 0.1,
+        collecting_num: int = 1,
         buffer_traj_num: int = 5000,
+        bon: ListConfig = [1]
     ):
         self.cfg = FlowConfig()
         self.act_chunk = act_dim[0]
@@ -108,8 +110,9 @@ class NFTOnline(OffPolicyAlgorithm):
             support_multi_env=True,
         )
         self.steps_per_iter = steps_per_iter
-        self.collecting_ratio = collecting_ratio
+        self.collecting_num = collecting_num
         self.buffer_traj_num = buffer_traj_num
+        self.best_of_n = bon
 
         self.expectile = expectile
         self.temperature = temperature
@@ -288,12 +291,11 @@ class NFTOnline(OffPolicyAlgorithm):
             )
 
     def _online_collection(self, buffer: ReplayBuffer):
-        num_traj_to_collect = int(self.collecting_ratio * self.buffer_traj_num)
-        print(f"[INFO] start collection {num_traj_to_collect} trajecotries")
+        print(f"[INFO] start collection {self.collecting_num} trajecotries")
         collect_online_data(
             env=self.env, 
             buffer=buffer, 
-            num_trajectories=num_traj_to_collect, 
+            num_trajectories=self.collecting_num, 
             policy=self.policy,
             chunk_size= self.act_chunk,
             action_dim=self.action_dim,
@@ -344,8 +346,10 @@ class NFTOnline(OffPolicyAlgorithm):
 
             if self.num_timesteps % log_interval == 0:
                 self.logger.record("global_step", self.num_timesteps)
-                self.logger.record("eval/global_step", self.num_timesteps)
-                self.logger.record("train/global_step", self.num_timesteps)
+                self.logger.record("eval/policy_step", self.num_timesteps)
+                self.logger.record("train/policy_step", self.num_timesteps)
+                self.logger.record("eval/iql_step", self.num_timesteps)
+                self.logger.record("train/iqlr_step", self.num_timesteps)
                 self._dump_logs()
             
             # Callback (Evaluation / Checkpointing)
@@ -361,7 +365,7 @@ class NFTOnline(OffPolicyAlgorithm):
         self: SelfNFTOnline,
         iterations: int, # NOTE: This refers to gradient steps in offline RL
         callback: MaybeCallback = None,
-        log_interval: int = 10,
+        log_interval: int = 500,
         tb_log_name: str = "flow-nft",
         reset_num_timesteps: bool = False, # False to continue from BC
         progress_bar: bool = False,
@@ -389,10 +393,11 @@ class NFTOnline(OffPolicyAlgorithm):
         print("#"*80)
 
         while self.num_timesteps < total_timesteps:
-            # Collect Data (online)
+            # 1. Collect Data (online)
             self._online_collection(self.replay_buffer)
 
-            # Train IQL (Critics)
+            # 2. Train IQL (Critics)
+            # Switch to critic training mode
             self.critic.set_training_mode(True)
             self.value.train(True)
             self.policy.set_training_mode(False)
@@ -400,13 +405,13 @@ class NFTOnline(OffPolicyAlgorithm):
             for i in range(self.steps_per_iter):
                 self._train_qv_iql_step(buffer=self.replay_buffer, batch_size=self.batch_size)
 
-                # Log IQL training with same frequency
+                # Log IQL training with same frequency using _n_updates as global_step
                 if (i + 1) % log_interval == 0:
-                    self.logger.record("global_step", self.num_timesteps)
-                    self.logger.record("train/iql_inner_step(global_step)", i + 1)
+                    self.logger.record("train/iql_step", self.num_timesteps + i + 1)
                     self._dump_logs()
             
-            # Train Policy (NFT)
+            # 3. Train Policy (NFT)
+            # Switch to policy training mode
             self.critic.set_training_mode(False)
             self.value.train(False)
             self.policy.set_training_mode(True)
@@ -420,9 +425,10 @@ class NFTOnline(OffPolicyAlgorithm):
 
                 # Logging
                 if self.num_timesteps % log_interval == 0:
+                    # Use _n_updates to ensure continuous x-axis with IQL phase
                     self.logger.record("global_step", self.num_timesteps)
-                    self.logger.record("eval/global_step", self.num_timesteps)
-                    self.logger.record("train/global_step", self.num_timesteps)
+                    self.logger.record("eval/policy_step", self.num_timesteps) # For eval tracking
+                    self.logger.record("train/policy_step", self.num_timesteps) # Original step tracking
                     self._dump_logs()
 
                 # Callback (Evaluation / Checkpointing)
@@ -628,7 +634,7 @@ def collect_online_data(
         chunk_size: int,
         action_dim: int,
         device,
-        flow_steps: int = 10
+        flow_steps: int = 100
     ) -> None:
     env_trajectories = [
         {"obs": [], "next_obs": [], "actions": [], "rewards": [], "dones": [], "infos": []}
@@ -644,7 +650,6 @@ def collect_online_data(
         obs_tensor = torch.as_tensor(obs, device=device, dtype=torch.float32)
 
         with torch.no_grad():
-            # Sampling via Flow Matching
             x = noise
             dt = 1.0 / flow_steps
 
@@ -652,19 +657,19 @@ def collect_online_data(
                 t_val = i * dt
                 t_tensor = torch.full((env.num_envs,), t_val, device=device)
 
-                # predict flow field v_pred
                 v_pred = policy(obs_tensor, x, t_tensor)
-                
-                # Euler step: x_{t+1} = x_t + v_pred * dt
                 x = x + v_pred * dt
 
             action_chunk = x.cpu().numpy()
-            
-            # Clip action if possible
-            if hasattr(env, "action_space") and isinstance(env.action_space, spaces.Box):
-                action_chunk = np.clip(action_chunk, env.action_space.low, env.action_space.high)
+            assert action_chunk.shape == (env.num_envs, chunk_size, action_dim), f"Unexpected action_chunk shape"
 
-        assert action_chunk.shape == (env.num_envs, chunk_size, action_dim), f"Unexpected action_chunk shape"
+            if hasattr(env, "action_space") and isinstance(env.action_space, spaces.Box):
+                action_chunk = np.clip(
+                    action_chunk.reshape(env.num_envs, -1), 
+                    env.action_space.low.reshape(env.num_envs, -1), 
+                    env.action_space.high.reshape(env.num_envs, -1)
+                ).reshape(env.num_envs, chunk_size, action_dim)
+
         next_obs, reward, done, info = env.step(action_chunk)
 
         for i in range(env.num_envs):
