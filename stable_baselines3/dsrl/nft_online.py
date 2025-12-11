@@ -4,6 +4,7 @@ import copy
 import numpy as np
 import torch
 import pathlib
+import tqdm
 from gymnasium import spaces
 import torch.nn as nn
 from torch.nn import functional as F
@@ -24,6 +25,7 @@ from stable_baselines3.common.utils import polyak_update, expectile_loss
 from stable_baselines3.common.save_util import load_from_pkl
 
 from .networks import FlowConfig, FlowPolicy, CriticNetwork, ValueNetwork
+from sources.collect_init_data import _add_traj_to_buffer
 
 SelfNFTOnline = TypeVar("SelfNFTOnline", bound="NFTOnline")
 
@@ -67,9 +69,13 @@ class NFTOnline(OffPolicyAlgorithm):
         device: Union[torch.device, str] = "auto",
         _init_setup_model: bool = True,
         max_episode_steps: int = 400,
-        steps_per_iter: int = 10000
+        steps_per_iter: int = 10000,
+        collecting_ratio: float = 0.1,
+        buffer_traj_num: int = 5000,
     ):
         self.cfg = FlowConfig()
+        self.act_chunk = act_dim[0]
+        self.action_dim = act_dim[1]
 
         if policy_kwargs is None:
             policy_kwargs = {}
@@ -102,6 +108,8 @@ class NFTOnline(OffPolicyAlgorithm):
             support_multi_env=True,
         )
         self.steps_per_iter = steps_per_iter
+        self.collecting_ratio = collecting_ratio
+        self.buffer_traj_num = buffer_traj_num
 
         self.expectile = expectile
         self.temperature = temperature
@@ -279,6 +287,20 @@ class NFTOnline(OffPolicyAlgorithm):
                 f"Loaded {len(pkl_paths)} files, appended {total_added} transitions to target buffer."
             )
 
+    def _online_collection(self, buffer: ReplayBuffer):
+        num_traj_to_collect = int(self.collecting_ratio * self.buffer_traj_num)
+        print(f"[INFO] start collection {num_traj_to_collect} trajecotries")
+        collect_online_data(
+            env=self.env, 
+            buffer=buffer, 
+            num_trajectories=num_traj_to_collect, 
+            policy=self.policy,
+            chunk_size= self.act_chunk,
+            action_dim=self.action_dim,
+            device=self.device,
+            flow_steps=self.cfg.flow_steps
+        )
+
     def learn_bc_iql(
         self: SelfNFTOnline,
         iterations: int,
@@ -357,6 +379,7 @@ class NFTOnline(OffPolicyAlgorithm):
             tb_log_name=tb_log_name, 
             progress_bar=progress_bar
         )
+
         callback.on_training_start(locals(), globals())
         print("\n\n","#"*80)
         print(f"[INFO] Starting NFT Phase for {iterations} steps...")
@@ -366,32 +389,48 @@ class NFTOnline(OffPolicyAlgorithm):
         print("#"*80)
 
         while self.num_timesteps < total_timesteps:
-            # We perform IQL updates first to get accurate Advantage
+            # Collect Data (online)
+            self._online_collection(self.replay_buffer)
+
+            # Train IQL (Critics)
             self.critic.set_training_mode(True)
             self.value.train(True)
             self.policy.set_training_mode(False)
-            self._train_qv_iql_step(buffer=self.replay_buffer, batch_size=self.batch_size)
             
-            # Update Policy (NFT)
+            for i in range(self.steps_per_iter):
+                self._train_qv_iql_step(buffer=self.replay_buffer, batch_size=self.batch_size)
+
+                # Log IQL training with same frequency
+                if (i + 1) % log_interval == 0:
+                    self.logger.record("global_step", self.num_timesteps)
+                    self.logger.record("train/iql_inner_step(global_step)", i + 1)
+                    self._dump_logs()
+            
+            # Train Policy (NFT)
             self.critic.set_training_mode(False)
             self.value.train(False)
             self.policy.set_training_mode(True)
-            self._train_nft_step(buffer=self.replay_buffer, batch_size=self.batch_size)
 
-            # Update counters
-            self.num_timesteps += 1
-            self._n_updates += 1
+            for _ in range(self.steps_per_iter):
+                self._train_nft_step(buffer=self.replay_buffer, batch_size=self.batch_size)
 
-            # Logging
-            if self.num_timesteps % log_interval == 0:
-                self.logger.record("global_step", self.num_timesteps)
-                self.logger.record("eval/global_step", self.num_timesteps)
-                self.logger.record("train/global_step", self.num_timesteps)
-                self._dump_logs()
+                # Update counters
+                self.num_timesteps += 1
+                self._n_updates += 1
 
-            # Callback (Evaluation / Checkpointing)
-            callback.update_locals(locals())
-            if not callback.on_step():
+                # Logging
+                if self.num_timesteps % log_interval == 0:
+                    self.logger.record("global_step", self.num_timesteps)
+                    self.logger.record("eval/global_step", self.num_timesteps)
+                    self.logger.record("train/global_step", self.num_timesteps)
+                    self._dump_logs()
+
+                # Callback (Evaluation / Checkpointing)
+                callback.update_locals(locals())
+                if not callback.on_step():
+                    break
+            
+            if self.num_timesteps >= total_timesteps:
                 break
 
         callback.on_training_end()
@@ -579,3 +618,84 @@ class NFTOnline(OffPolicyAlgorithm):
 
     def _get_torch_save_params(self) -> Tuple[List[str], List[str]]:
         return ["policy", "critic", "value", "policy_old", "policy_optimizer", "critic_optimizer", "value_optimizer"], []
+
+
+def collect_online_data(
+        env: Union[GymEnv, str], 
+        buffer: ReplayBuffer, 
+        num_trajectories: int, 
+        policy, 
+        chunk_size: int,
+        action_dim: int,
+        device,
+        flow_steps: int = 10
+    ) -> None:
+    env_trajectories = [
+        {"obs": [], "next_obs": [], "actions": [], "rewards": [], "dones": [], "infos": []}
+        for _ in range(env.num_envs)
+    ]
+    obs = env.reset()
+    
+    total_collected_trajectories = 0
+    pbar = tqdm(total=num_trajectories, desc="Collecting Trajectories")
+
+    while total_collected_trajectories < num_trajectories:
+        noise = torch.randn(env.num_envs, chunk_size, action_dim, device=device)
+        obs_tensor = torch.as_tensor(obs, device=device, dtype=torch.float32)
+
+        with torch.no_grad():
+            # Sampling via Flow Matching
+            x = noise
+            dt = 1.0 / flow_steps
+
+            for i in range(flow_steps):
+                t_val = i * dt
+                t_tensor = torch.full((env.num_envs,), t_val, device=device)
+
+                # predict flow field v_pred
+                v_pred = policy(obs_tensor, x, t_tensor)
+                
+                # Euler step: x_{t+1} = x_t + v_pred * dt
+                x = x + v_pred * dt
+
+            action_chunk = x.cpu().numpy()
+            
+            # Clip action if possible
+            if hasattr(env, "action_space") and isinstance(env.action_space, spaces.Box):
+                action_chunk = np.clip(action_chunk, env.action_space.low, env.action_space.high)
+
+        assert action_chunk.shape == (env.num_envs, chunk_size, action_dim), f"Unexpected action_chunk shape"
+        next_obs, reward, done, info = env.step(action_chunk)
+
+        for i in range(env.num_envs):
+            traj = env_trajectories[i]
+            
+            real_next_obs = next_obs[i]
+            if done[i] and info[i] and "terminal_observation" in info[i]:
+                real_next_obs = info[i]["terminal_observation"]
+
+            traj["obs"].append(obs[i])
+            traj["next_obs"].append(real_next_obs)
+            traj["actions"].append(action_chunk[i])  # (chunk_size, action_dim)
+            traj["rewards"].append(reward[i])
+            traj["dones"].append(done[i])
+            traj["infos"].append(info[i])
+
+            if done[i]:
+                if total_collected_trajectories < num_trajectories:
+                    added = _add_traj_to_buffer(
+                        traj=traj,
+                        buffer=buffer,
+                    )
+                    if added:
+                        total_collected_trajectories += 1
+                        pbar.update(1)
+                
+                env_trajectories[i] = {
+                    "obs": [], "next_obs": [], "actions": [],
+                    "rewards": [], "dones": [], "infos": []
+                }
+
+        obs = next_obs
+
+    pbar.close()   
