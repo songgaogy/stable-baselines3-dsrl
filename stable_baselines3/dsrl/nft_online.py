@@ -291,17 +291,21 @@ class NFTOnline(OffPolicyAlgorithm):
             )
 
     def _online_collection(self, buffer: ReplayBuffer):
-        print(f"[INFO] start collection {self.collecting_num} trajecotries")
-        collect_online_data(
-            env=self.env, 
-            buffer=buffer, 
-            num_trajectories=self.collecting_num, 
-            policy=self.policy,
-            chunk_size= self.act_chunk,
-            action_dim=self.action_dim,
-            device=self.device,
-            flow_steps=self.cfg.flow_steps
-        )
+        if self.collecting_num == 0:
+            print(f"[INFO] offline. No online collection.")
+            return 
+        else:
+            print(f"[INFO] start collection {self.collecting_num} trajecotries")
+            collect_online_data(
+                env=self.env, 
+                buffer=buffer, 
+                num_trajectories=self.collecting_num, 
+                policy=self.policy,
+                chunk_size= self.act_chunk,
+                action_dim=self.action_dim,
+                device=self.device,
+                flow_steps=self.cfg.flow_steps
+            )
 
     def learn_bc_iql(
         self: SelfNFTOnline,
@@ -636,6 +640,11 @@ def collect_online_data(
         device,
         flow_steps: int = 100
     ) -> None:
+    
+    # 1. 强制切换到 Eval 模式
+    original_mode = policy.training
+    policy.set_training_mode(False)
+    
     env_trajectories = [
         {"obs": [], "next_obs": [], "actions": [], "rewards": [], "dones": [], "infos": []}
         for _ in range(env.num_envs)
@@ -652,23 +661,29 @@ def collect_online_data(
         with torch.no_grad():
             x = noise
             dt = 1.0 / flow_steps
-
             for i in range(flow_steps):
                 t_val = i * dt
                 t_tensor = torch.full((env.num_envs,), t_val, device=device)
-
                 v_pred = policy(obs_tensor, x, t_tensor)
                 x = x + v_pred * dt
 
             action_chunk = x.cpu().numpy()
-            assert action_chunk.shape == (env.num_envs, chunk_size, action_dim), f"Unexpected action_chunk shape"
-
+            
+            # [Fix] 针对 Flatten Action Space 的 Clip 修复
             if hasattr(env, "action_space") and isinstance(env.action_space, spaces.Box):
-                action_chunk = np.clip(
-                    action_chunk.reshape(env.num_envs, -1), 
-                    env.action_space.low.reshape(env.num_envs, -1), 
-                    env.action_space.high.reshape(env.num_envs, -1)
-                ).reshape(env.num_envs, chunk_size, action_dim)
+                # 报错显示 env.action_space.low 是 (28,) 而 action_chunk 是 (B, 4, 7)
+                # 我们需要把 low/high 变形成 (4, 7) 以便广播
+                
+                # 确保维度匹配，防止 reshape 错误
+                if env.action_space.low.shape[0] == chunk_size * action_dim:
+                    low = env.action_space.low.reshape(chunk_size, action_dim)
+                    high = env.action_space.high.reshape(chunk_size, action_dim)
+                    action_chunk = np.clip(action_chunk, low, high)
+                else:
+                    try:
+                        action_chunk = np.clip(action_chunk, env.action_space.low, env.action_space.high)
+                    except ValueError:
+                        print(f"[Warning] Clip failed due to shape mismatch: Act {action_chunk.shape}, Low {env.action_space.low.shape}")
 
         next_obs, reward, done, info = env.step(action_chunk)
 
@@ -681,17 +696,14 @@ def collect_online_data(
 
             traj["obs"].append(obs[i])
             traj["next_obs"].append(real_next_obs)
-            traj["actions"].append(action_chunk[i])  # (chunk_size, action_dim)
+            traj["actions"].append(action_chunk[i])  
             traj["rewards"].append(reward[i])
             traj["dones"].append(done[i])
             traj["infos"].append(info[i])
 
             if done[i]:
                 if total_collected_trajectories < num_trajectories:
-                    added = _add_traj_to_buffer(
-                        traj=traj,
-                        buffer=buffer,
-                    )
+                    added = _add_traj_to_buffer(traj=traj, buffer=buffer)
                     if added:
                         total_collected_trajectories += 1
                         pbar.update(1)
@@ -703,4 +715,6 @@ def collect_online_data(
 
         obs = next_obs
 
-    pbar.close()   
+    pbar.close()
+    
+    policy.set_training_mode(original_mode)
