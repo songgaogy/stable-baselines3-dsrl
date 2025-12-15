@@ -33,6 +33,7 @@ keys/
 .idea
 
 logs/
+logs_console/
 
 .ipynb_checkpoints
 ghostdriver.log

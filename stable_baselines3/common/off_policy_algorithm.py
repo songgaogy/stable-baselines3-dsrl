@@ -215,6 +215,25 @@ class OffPolicyAlgorithm(BaseAlgorithm):
             )
             print("success buffer init")
 
+        # (gaoyuan) added
+        if getattr(self, "fail_buffer", None) is None:
+            fail_kwargs = getattr(self, "fail_buffer_kwargs", {}).copy()
+            fail_buffer_size = self.buffer_size
+
+            if issubclass(self.replay_buffer_class, HerReplayBuffer):
+                succ_kwargs["env"] = self.env
+
+            self.fail_buffer = self.replay_buffer_class(
+                fail_buffer_size,
+                self.observation_space,
+                self.action_space,
+                device=self.device,
+                n_envs=self.n_envs,
+                optimize_memory_usage=self.optimize_memory_usage,
+                **fail_kwargs,
+            )
+            print("fail buffer init")
+
         self.policy = self.policy_class(
             self.observation_space,
             self.action_space,

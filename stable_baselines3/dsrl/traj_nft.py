@@ -1,3 +1,4 @@
+import re
 import math
 import time
 import copy
@@ -19,7 +20,6 @@ from stable_baselines3.common.off_policy_algorithm import OffPolicyAlgorithm
 
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback
 from stable_baselines3.common.noise import ActionNoise
-from stable_baselines3.common.vec_env import VecEnv
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.her.her_replay_buffer import HerReplayBuffer
 from stable_baselines3.common.utils import polyak_update, expectile_loss
@@ -28,11 +28,11 @@ from stable_baselines3.common.save_util import load_from_pkl
 from .networks import FlowConfig, FlowPolicy, CriticNetwork, ValueNetwork
 from sources.collect_init_data import _add_traj_to_buffer
 
-SelfNFTOnline = TypeVar("SelfNFTOnline", bound="NFTOnline")
+SelfTrajNFT = TypeVar("SelfTrajNFT", bound="TrajNFT")
 
 
 
-class NFTOnline(OffPolicyAlgorithm):
+class TrajNFT(OffPolicyAlgorithm):
     """
     FLOW: IQL Critics + Flow-Matching Policy (Offline RL).
     
@@ -67,13 +67,18 @@ class NFTOnline(OffPolicyAlgorithm):
         policy_kwargs: Optional[dict[str, Any]] = None,
         verbose: int = 0,
         seed: Optional[int] = None,
+        debug: bool = False,
         device: Union[torch.device, str] = "auto",
         _init_setup_model: bool = True,
         max_episode_steps: int = 400,
         steps_per_iter: int = 10000,
         collecting_num: int = 1,
-        buffer_traj_num: int = 5000,
-        bon: ListConfig = [1]
+        nft_delta: float = 1.0,
+        with_scale: bool = True,
+        sample_mode: str = "half_succ_fail",
+        reward_mode: str = "01",
+        update_freq: int = 1000,
+        succ_warmup_traj: int = 10
     ):
         self.cfg = FlowConfig()
         self.act_chunk = act_dim[0]
@@ -109,10 +114,16 @@ class NFTOnline(OffPolicyAlgorithm):
             supported_action_spaces=(spaces.Box,),
             support_multi_env=True,
         )
+        self.debug = debug
+
         self.steps_per_iter = steps_per_iter
         self.collecting_num = collecting_num
-        self.buffer_traj_num = buffer_traj_num
-        self.best_of_n = bon
+        self.nft_delta = nft_delta
+        self.with_scale = with_scale
+        self.sample_mode = sample_mode
+        self.reward_mode = reward_mode
+        self.update_freq = update_freq
+        self.succ_warmup_traj = succ_warmup_traj
 
         self.expectile = expectile
         self.temperature = temperature
@@ -129,7 +140,7 @@ class NFTOnline(OffPolicyAlgorithm):
             self._setup_model()
 
     def _setup_model(self) -> None:
-        super(NFTOnline, self)._setup_model()
+        super(TrajNFT, self)._setup_model()
         
         self.policy = self.policy_class(
             self.observation_space,
@@ -166,7 +177,7 @@ class NFTOnline(OffPolicyAlgorithm):
         
         self.critic_target.load_state_dict(self.critic.state_dict())
         self.critic_target.set_training_mode(False)
-
+        
         self.value = ValueNetwork(
             self.observation_space, 
             hidden_dim=256
@@ -223,57 +234,96 @@ class NFTOnline(OffPolicyAlgorithm):
         directory: Union[str, pathlib.Path],
         target_buffer: ReplayBuffer,
         prefix: str = "success_data",
+        num_trajs: Optional[int] = None,
         truncate_last_traj: bool = True,
         verbose: int = 1,
     ) -> None:
         """(gaoyuan)
-        Load multiple replay buffer .pkl files from a directory and
-        append their transitions into a target buffer (e.g. succ_buffer or all_buffer).
-
-        This uses the same loading logic as `load_replay_buffer` / `load_from_pkl`
-        from SB3, but does not overwrite `self.replay_buffer`.
-
-        :param directory: Directory containing pickled replay buffers.
-        :param target_buffer: The buffer to which transitions will be appended.
-        :param prefix: Filename prefix to match, e.g. "success_data".
-        :param truncate_last_traj: Same meaning as in `load_replay_buffer` for HerReplayBuffer.
-        :param verbose: Verbosity level.
+        Load replay buffer files. 
+        It first scans all files to verify total availability.
+        Then it loads files sequentially until `num_trajs` is reached.
+        For the last file needed, it loads a fraction based on the remaining count.
         """
         directory = pathlib.Path(directory)
         pattern = f"{prefix}*.pkl"
         pkl_paths = sorted(directory.glob(pattern))
 
-        if verbose > 0:
-            print(f"[load_multiple_replay_buffers] Found {len(pkl_paths)} files with pattern '{pattern}' in {directory}")
+        if len(pkl_paths) == 0:
+            print(f"[load_multiple_replay_buffers] No files found with pattern '{pattern}' in {directory}")
+            return
 
-        total_added = 0
-
+        # pre-scan
+        file_meta = [] # Stores (path, traj_count)
+        total_available_trajs = 0
+        
         for path in pkl_paths:
+            match = re.search(r"trajs_(\d+)", path.name)    # match for filename "trajs_1000"
+            if match:
+                count = int(match.group(1))
+            else:
+                if verbose > 0:
+                    print(f"[Warning] Filename {path.name} does not match 'trajs_X'. Skipping trajectory count check for this file.")
+                count = 0 # Fallback or handle as error depending on strictness
+            
+            file_meta.append((path, count))
+            total_available_trajs += count
+
+        if verbose > 0:
+            print(f"[Pre-scan] Found {len(pkl_paths)} files. Total available trajectories on disk: {total_available_trajs}")
+
+        # Check if requested amount is feasible
+        if num_trajs is not None and num_trajs > total_available_trajs:
+            print(f"[Warning] Requested {num_trajs} trajs, but only {total_available_trajs} are available. Will load ALL.")
+            num_trajs = total_available_trajs # Cap it at max available
+
+        # loading loop
+        total_collected_trajs = 0
+        total_added_transitions = 0
+
+        for path, file_traj_count in file_meta:
+            if num_trajs is not None and total_collected_trajs >= num_trajs:
+                break
+
+            load_full_file = True
+            trajs_to_take_from_this_file = file_traj_count
+
+            if num_trajs is not None:
+                needed = num_trajs - total_collected_trajs
+                if needed < file_traj_count:
+                    load_full_file = False
+                    trajs_to_take_from_this_file = needed
+                else:
+                    load_full_file = True
+                    trajs_to_take_from_this_file = file_traj_count
+
             if verbose > 0:
-                print(f"[load_multiple_replay_buffers] Loading {path.name}")
+                mode_str = "FULL" if load_full_file else f"PARTIAL ({trajs_to_take_from_this_file}/{file_traj_count})"
+                print(f"[Loading] {path.name} | Mode: {mode_str}")
 
-            # Use the same logic as original load_from_pkl
-            loaded_buffer = load_from_pkl(path, verbose=verbose)
-            assert isinstance(
-                loaded_buffer, ReplayBuffer
-            ), "The loaded object must inherit from ReplayBuffer class"
-
-            if not hasattr(loaded_buffer, "handle_timeout_termination"):  # pragma: no cover
+            # Load the heavy data
+            loaded_buffer = load_from_pkl(path, verbose=0) # keep inner verbose low
+            
+            assert isinstance(loaded_buffer, ReplayBuffer), "Object must be ReplayBuffer"
+            if not hasattr(loaded_buffer, "handle_timeout_termination"):
                 loaded_buffer.handle_timeout_termination = False
                 loaded_buffer.timeouts = np.zeros_like(loaded_buffer.dones)
-
             if isinstance(loaded_buffer, HerReplayBuffer):
-                assert self.env is not None, "You must pass an environment when using `HerReplayBuffer`"
                 loaded_buffer.set_env(self.env)
                 if truncate_last_traj:
                     loaded_buffer.truncate_last_trajectory()
-
-            # Match device to current setting
             loaded_buffer.device = self.device
 
-            # Append transitions from loaded_buffer into target_buffer
-            n_transitions = loaded_buffer.size()
-            for idx in range(n_transitions):
+            n_transitions_in_file = loaded_buffer.size()
+            if load_full_file:
+                steps_to_load = n_transitions_in_file
+            else:
+                if file_traj_count > 0:
+                    ratio = trajs_to_take_from_this_file / file_traj_count
+                    steps_to_load = int(n_transitions_in_file * ratio)
+                else:
+                    steps_to_load = n_transitions_in_file
+
+            for idx in range(steps_to_load):
                 obs = loaded_buffer.observations[idx]
                 next_obs = loaded_buffer.next_observations[idx]
                 actions = loaded_buffer.actions[idx]
@@ -282,23 +332,29 @@ class NFTOnline(OffPolicyAlgorithm):
                 infos = [{} for _ in range(self.n_envs)]
 
                 target_buffer.add(obs, next_obs, actions, rewards, dones, infos)
-                total_added += 1
+                total_added_transitions += 1
+
+            total_collected_trajs += trajs_to_take_from_this_file
+            
+            if verbose > 0:
+                print(f"    -> Added {steps_to_load} steps (approx {trajs_to_take_from_this_file} trajs). Progress: {total_collected_trajs}/{num_trajs if num_trajs else 'ALL'}")
 
         if verbose > 0:
             print(
-                f"[load_multiple_replay_buffers] Done. "
-                f"Loaded {len(pkl_paths)} files, appended {total_added} transitions to target buffer."
+                f"[load_multiple_replay_buffers] Finished. "
+                f"Total Trajs: {total_collected_trajs}, Total Steps: {total_added_transitions}."
             )
 
-    def _online_collection(self, buffer: ReplayBuffer):
+    def _online_collection(self, succ_buffer: ReplayBuffer, fail_buffer: ReplayBuffer):
         if self.collecting_num == 0:
-            print(f"[INFO] offline. No online collection.")
+            print(f"\n[INFO] offline. No online collection.")
             return 
         else:
-            print(f"[INFO] start collection {self.collecting_num} trajecotries")
+            print(f"\n[INFO] start collection {self.collecting_num} trajecotries")
             collect_online_data(
                 env=self.env, 
-                buffer=buffer, 
+                succ_buffer=succ_buffer, 
+                fail_buffer=fail_buffer,
                 num_trajectories=self.collecting_num, 
                 policy=self.policy,
                 chunk_size= self.act_chunk,
@@ -307,20 +363,31 @@ class NFTOnline(OffPolicyAlgorithm):
                 flow_steps=self.cfg.flow_steps
             )
 
-    def learn_bc_iql(
-        self: SelfNFTOnline,
+    def learn_bc(
+        self: SelfTrajNFT,
         iterations: int,
         callback: MaybeCallback = None,
         log_interval: int = 200,
-        tb_log_name: str = "flow-nft",
+        tb_log_name: str = "traj_nft",
         reset_num_timesteps: bool = True,
         progress_bar: bool = False,
-    ) -> SelfNFTOnline:
+    ) -> SelfTrajNFT:
         """
         Behavior Cloning to warmup NFT.  
         Trains the flow policy to match the dataset distribution (Offline).
         """
-        self.eval_freq = callback[1].eval_freq
+        eval_callback = callback[1]
+        original_eval_freq = eval_callback.eval_freq
+        if not self.debug:
+            if iterations > 100000:
+                eval_callback.eval_freq = int(original_eval_freq / 10)
+                bc_eval_freq = eval_callback.eval_freq
+            else:
+                eval_callback.eval_freq = int(iterations / 2)
+                bc_eval_freq = eval_callback.eval_freq
+        else:
+            bc_eval_freq = original_eval_freq
+
         total_timesteps, callback = self._setup_learn(
             iterations, 
             callback, 
@@ -330,30 +397,21 @@ class NFTOnline(OffPolicyAlgorithm):
         )
         callback.on_training_start(locals(), globals())
         print(f"[FLOW] Starting BC Phase for {iterations} steps...")
-        print(f"[INFO] eval freq: {self.eval_freq}")
+        print(f"[INFO] BC eval freq: {bc_eval_freq}")
 
         while self.num_timesteps < total_timesteps:
             # BC for policy
             self.policy.set_training_mode(True)
             self._train_bc_step(buffer=self.succ_buffer, batch_size=self.batch_size)
             self.policy.set_training_mode(False)
-
-            # IQL for Q and V
-            self.critic.set_training_mode(True)
-            self.value.train(True)
-            self._train_qv_iql_step(buffer=self.replay_buffer, batch_size=self.batch_size)
-            self.critic.set_training_mode(False)
-            self.value.train(False)
             
             self.num_timesteps += 1
             self._n_updates += 1
 
             if self.num_timesteps % log_interval == 0:
                 self.logger.record("global_step", self.num_timesteps)
-                self.logger.record("eval/policy_step", self.num_timesteps)
-                self.logger.record("train/policy_step", self.num_timesteps)
-                self.logger.record("eval/iql_step", self.num_timesteps)
-                self.logger.record("train/iqlr_step", self.num_timesteps)
+                self.logger.record("eval/global_step", self.num_timesteps)
+                self.logger.record("train/global_step", self.num_timesteps)
                 self._dump_logs()
             
             # Callback (Evaluation / Checkpointing)
@@ -363,17 +421,18 @@ class NFTOnline(OffPolicyAlgorithm):
                 break
 
         callback.on_training_end()
+        eval_callback.eval_freq = original_eval_freq
         return self
 
     def learn(
-        self: SelfNFTOnline,
+        self: SelfTrajNFT,
         iterations: int, # NOTE: This refers to gradient steps in offline RL
         callback: MaybeCallback = None,
         log_interval: int = 500,
-        tb_log_name: str = "flow-nft",
+        tb_log_name: str = "traj_nft",
         reset_num_timesteps: bool = False, # False to continue from BC
         progress_bar: bool = False,
-    ) -> SelfNFTOnline:
+    ) -> SelfTrajNFT:
         """
         NFT (Negative Flow Tuning) + IQL (Value Learning).
         Updates Critics (Q/V) and refines Policy using Advantage.
@@ -389,39 +448,48 @@ class NFTOnline(OffPolicyAlgorithm):
         )
 
         callback.on_training_start(locals(), globals())
-        print("\n\n","#"*80)
+        print(f"\n\n{'#'*80}")
         print(f"[INFO] Starting NFT Phase for {iterations} steps...")
         print(f"[INFO] eval freq: {eval_freq}")
         print(f"[INFO] online collection freq: {self.steps_per_iter}")
         print(f"[INFO] total online collection times: {int(total_timesteps / self.steps_per_iter)}")
         print("#"*80)
 
+        # NOTE: success buffer should be reset when start nft phase
+        self.succ_buffer.reset()
+        warmup_succ_buffer(
+            env=self.env,
+            succ_buffer=self.succ_buffer,
+            num_trajectories=self.succ_warmup_traj,
+            policy=self.policy,
+            chunk_size= self.act_chunk,
+            action_dim=self.action_dim,
+            device=self.device,
+            flow_steps=self.cfg.flow_steps
+        )
+
         while self.num_timesteps < total_timesteps:
-            # 1. Collect Data (online)
-            self._online_collection(self.replay_buffer)
+            # Collect Data (online)
+            self._online_collection(self.succ_buffer, self.fail_buffer)
 
-            # 2. Train IQL (Critics)
-            # Switch to critic training mode
-            self.critic.set_training_mode(True)
-            self.value.train(True)
-            self.policy.set_training_mode(False)
-            
-            for i in range(self.steps_per_iter):
-                self._train_qv_iql_step(buffer=self.replay_buffer, batch_size=self.batch_size)
-
-                # Log IQL training with same frequency using _n_updates as global_step
-                if (i + 1) % log_interval == 0:
-                    self.logger.record("train/iql_step", self.num_timesteps + i + 1)
-                    self._dump_logs()
-            
-            # 3. Train Policy (NFT)
-            # Switch to policy training mode
             self.critic.set_training_mode(False)
             self.value.train(False)
             self.policy.set_training_mode(True)
 
             for _ in range(self.steps_per_iter):
-                self._train_nft_step(buffer=self.replay_buffer, batch_size=self.batch_size)
+                self._train_nft_step(
+                    succ_buffer=self.succ_buffer,
+                    fail_buffer=self.fail_buffer,
+                    batch_size=self.batch_size, 
+                    nft_delta=self.nft_delta,
+                    with_scale=self.with_scale,
+                    sample_mode=self.sample_mode,
+                    reward_mode=self.reward_mode,
+                )
+
+                if (self.num_timesteps + 1) % self.update_freq == 0:
+                    # Polyak averaging for old policy
+                    polyak_update(self.policy.parameters(), self.policy_old.parameters(), self.policy_eta)
 
                 # Update counters
                 self.num_timesteps += 1
@@ -429,10 +497,10 @@ class NFTOnline(OffPolicyAlgorithm):
 
                 # Logging
                 if self.num_timesteps % log_interval == 0:
-                    # Use _n_updates to ensure continuous x-axis with IQL phase
                     self.logger.record("global_step", self.num_timesteps)
-                    self.logger.record("eval/policy_step", self.num_timesteps) # For eval tracking
-                    self.logger.record("train/policy_step", self.num_timesteps) # Original step tracking
+                    self.logger.record("eval/global_step", self.num_timesteps)
+                    self.logger.record("train/global_step", self.num_timesteps)
+                    self.logger.record("buffer/global_step", self.num_timesteps)
                     self._dump_logs()
 
                 # Callback (Evaluation / Checkpointing)
@@ -443,12 +511,17 @@ class NFTOnline(OffPolicyAlgorithm):
             if self.num_timesteps >= total_timesteps:
                 break
 
+            # NOTE: every time finish one loop, the fail_buffer should be reset
+            self.fail_buffer.reset()
+
         callback.on_training_end()
         return self
 
     def _train_bc_step(self, buffer: ReplayBuffer, batch_size: int) -> None:
         """
         Single gradient step for Behavior Cloning, for policy only
+
+        The input data should always be success buffer, so there is no success mask.
         """
         replay_data = buffer.sample(batch_size, env=self._vec_normalize_env)
         obs = replay_data.observations
@@ -476,115 +549,126 @@ class NFTOnline(OffPolicyAlgorithm):
 
         self.logger.record("train/policy_bc_loss", loss.item())
 
-    def _train_qv_iql_step(self, buffer: ReplayBuffer, batch_size: int) -> None:
+    def _train_nft_step(self, succ_buffer: ReplayBuffer, fail_buffer: ReplayBuffer, batch_size: int, 
+                        nft_delta: float = 0.5, with_scale: bool = True, 
+                        sample_mode: str = "half_succ_fail", reward_mode: str = "01") -> None:
         """
-        Single gradient step for IQL (Q and V functions)
+        Single gradient step for NFT.
         """
-        replay_data = buffer.sample(batch_size, env=self._vec_normalize_env)
-        obs = replay_data.observations
-        actions = replay_data.actions
-        next_obs = replay_data.next_observations
-        rewards = replay_data.rewards
-        dones = replay_data.dones
-
-        # Value Loss (Expectile Regression)
-        with torch.no_grad():
-            # NOTE(gaoyuan) actions are flattened
-            target_q1, target_q2 = self.critic_target(obs, actions)
-            target_q = torch.min(target_q1, target_q2)
-
-        v_pred = self.value(obs)
-        v_loss = expectile_loss(target_q - v_pred, self.expectile)
-
-        self.value_optimizer.zero_grad()
-        v_loss.backward()
-        self.value_optimizer.step()
-
-        # Critic Loss
-        with torch.no_grad():
-            next_v = self.value(next_obs)
-            target_q_values = rewards + (1 - dones) * self.gamma * next_v
-
-        current_q1, current_q2 = self.critic(obs, actions)
-        critic_loss = F.mse_loss(current_q1, target_q_values) + F.mse_loss(current_q2, target_q_values)
-
-        self.critic_optimizer.zero_grad()
-        critic_loss.backward()
-        self.critic_optimizer.step()
-
-        # Soft update target critic
-        if self._n_updates % 1 == 0:
-            polyak_update(self.critic.parameters(), self.critic_target.parameters(), self.critic_eta)
+        # Determine mask values and dipole normalization parameters
+        if reward_mode in ["01", "10"]:
+            r_succ, r_fail = 1.0, 0.0
+        elif reward_mode in ["46", "64"]:
+            r_succ, r_fail = 0.6, 0.4
+        else:
+            raise ValueError(f"Unknown reward_mode: {reward_mode}")
         
-        self.logger.record("train/value_loss", v_loss.item())
-        self.logger.record("train/critic_loss", critic_loss.item())
-        self.logger.record("train/v_pred_mean", v_pred.mean().item())
+        # sample ###########################################################################################
+        n_succ = 0
+        n_fail = 0
+        size_succ = succ_buffer.buffer_size if succ_buffer.full else succ_buffer.pos
+        size_fail = fail_buffer.buffer_size if fail_buffer.full else fail_buffer.pos
 
-    def _train_nft_step(self, buffer: ReplayBuffer, batch_size: int, nft_beta: float = 1.0) -> None:
-        """
-        Single gradient step for NFT
-        """
-        replay_data = buffer.sample(batch_size, env=self._vec_normalize_env)
-        obs = replay_data.observations
-        actions = replay_data.actions
+        # different sample method
+        if sample_mode == "half_succ_fail":
+            n_succ = batch_size // 2
+            n_fail = batch_size - n_succ
+        elif sample_mode == "uniform_mix":
+            total_size = size_succ + size_fail
+            if total_size == 0:
+                raise ValueError("make sure the buffer is NOT empty!!")
+            p_succ = size_succ / total_size
+            n_succ = np.random.binomial(n=batch_size, p=p_succ)
+            n_fail = batch_size - n_succ
+        else:
+            raise ValueError("unknown sample method")
 
-        # advantage
-        with torch.no_grad():
-            # NOTE(gaoyuan) actions are flattened
-            target_q1, target_q2 = self.critic_target(obs, actions)
-            target_q = torch.min(target_q1, target_q2)
-            target_val = self.value(obs)
-            advantage = target_q - target_val
-            
-            # normalize advantage 
-            adv_mean = advantage.mean()
-            adv_std = advantage.std()
-            normalized_advantage = (advantage - adv_mean) / (adv_std + 1e-8)
-            
-            # weights for NFT
-            weights = torch.sigmoid(normalized_advantage * self.temperature)
-        
-        # Flow Matching Setup
-        # TODO(gaoyuan) check this
+        obs_list, act_list = [], []
+        r_mask_list = []
+
+        if n_succ > 0:
+            if (succ_buffer.full or succ_buffer.pos > 0):
+                succ_data = succ_buffer.sample(n_succ, env=self._vec_normalize_env)
+                obs_list.append(succ_data.observations)
+                act_list.append(succ_data.actions)
+                r_mask_list.append(torch.full((n_succ,), r_succ, device=self.device))
+            else:
+                n_fail += n_succ
+                n_succ = 0
+
+        # Collect Fail Data
+        if n_fail > 0:
+            if (fail_buffer.full or fail_buffer.pos > 0):
+                fail_data = fail_buffer.sample(n_fail, env=self._vec_normalize_env)
+                obs_list.append(fail_data.observations)
+                act_list.append(fail_data.actions)
+                
+                r_mask_list.append(torch.full((n_fail,), r_fail, device=self.device))
+            else:
+                pass
+
+        obs = torch.cat(obs_list, dim=0)
+        actions = torch.cat(act_list, dim=0)
+        r_mask = torch.cat(r_mask_list, dim=0).view(batch_size, 1, 1)
+
+        perm = torch.randperm(batch_size)
+        obs = obs[perm]
+        actions = actions[perm]
+        r_mask = r_mask[perm]
+
+        # training ###########################################################################################
         x_1 = actions.view(batch_size, self.policy.chunk_length, self.policy.act_dim)
-        # Expand weights to match action dims [B, 1, 1]
-        weights_expand = weights.view(batch_size, 1, 1)
-
         x_0 = torch.randn_like(x_1)
         t = torch.rand(batch_size, device=self.device)
-        t_expand = t.view(batch_size, 1, 1) if x_1.dim() == 3 else t.view(batch_size, 1)
-
+        t_expand = t.view(batch_size, 1, 1)
         x_t = (1.0 - t_expand) * x_0 + t_expand * x_1
-        target_v = x_1 - x_0
+        target_v = x_1 - x_0  # The ground truth vector field (u_t)
 
-        # Get old policy prediction (no grad)
         with torch.no_grad():
             old_v = self.policy_old(obs, x_t, t)
         
-        pred_v = self.policy(obs, x_t, t)   # Get current policy prediction (grad)
-
-        # Positive and Negative flow terms
-        positive_v = (1.0 - nft_beta) * old_v + nft_beta * pred_v
-        negative_v = (1.0 + nft_beta) * old_v - nft_beta * pred_v
+        pred_v = self.policy(obs, x_t, t)
+        delta_v_raw = target_v - old_v
+        old_v_norm = torch.norm(old_v, p=2, dim=(-1, -2), keepdim=True)
+        delta_v_raw_norm = torch.norm(delta_v_raw, p=2, dim=(-1, -2), keepdim=True)
+        neg_norm_ratio = delta_v_raw_norm / old_v_norm * (1 - r_mask)
         
-        loss_pos = torch.mean(weights_expand * (positive_v - target_v)**2)
-        loss_neg = torch.mean(weights_expand * (negative_v - target_v)**2)
-        actor_loss = loss_pos + loss_neg
+        # TODO(gaoyuan) check this
+        if with_scale:
+            scale_factor = torch.minimum(
+                torch.tensor(1.0, device=self.device), 
+                nft_delta * old_v_norm / (delta_v_raw_norm + 1e-8)
+            )
+        else:
+            scale_factor = torch.tensor(1.0, device=self.device)
+        nft_target_v = old_v + scale_factor * delta_v_raw * (2 * r_mask - 1)
+        actor_loss = torch.mean((pred_v - nft_target_v) ** 2)
 
         self.policy_optimizer.zero_grad()
         actor_loss.backward()
         self.policy_optimizer.step()
 
-        # implement ema update
-        polyak_update(self.policy.parameters(), self.policy_old.parameters(), self.policy_eta)
+        # just for log
+        with torch.no_grad():
+            nft_beta = 1.0
+            positive_v = (1.0 - nft_beta) * old_v + nft_beta * pred_v
+            negative_v = (1.0 + nft_beta) * old_v - nft_beta * pred_v
+            
+            # regardless of whether r was 0.6 or 1.0
+            loss_pos_raw = torch.mean(r_mask * (positive_v - target_v)**2)
+            loss_neg_raw = torch.mean((1.0 - r_mask) * (negative_v - target_v)**2)
 
+        # logging ###########################################################################################
         self.logger.record("train/nft_actor_loss", actor_loss.item())
-        self.logger.record("train/nft_pos_loss", loss_pos.item())
-        self.logger.record("train/nft_neg_loss", loss_neg.item())
-        self.logger.record("train/advantage_mean", adv_mean.item())
-        self.logger.record("train/normalized_adv", normalized_advantage.mean().item())
-        self.logger.record("train/weights: sig(norm_A*temp)", weights.mean().item())
+        self.logger.record("train/positive_loss", loss_pos_raw.item())
+        self.logger.record("train/negative_loss", loss_neg_raw.item())
+        self.logger.record("train/scale_factor_mean", scale_factor.mean().item())
+        self.logger.record("train/delta_v_raw_norm", delta_v_raw_norm.mean().item())
+        self.logger.record("train/old_v_norm", old_v_norm.mean().item())
+        self.logger.record("train/neg_norm_ratio", neg_norm_ratio.mean().item())
         self.logger.record("train/ema_eta", self.policy_eta)
+        self.logger.record("buffer/success_buffer", size_succ)
+        self.logger.record("buffer/fail_buffer", size_fail)
 
     def predict(
         self,
@@ -632,16 +716,16 @@ class NFTOnline(OffPolicyAlgorithm):
 
 def collect_online_data(
         env: Union[GymEnv, str], 
-        buffer: ReplayBuffer, 
+        succ_buffer: ReplayBuffer, 
+        fail_buffer: ReplayBuffer, 
         num_trajectories: int, 
         policy, 
         chunk_size: int,
         action_dim: int,
         device,
-        flow_steps: int = 100
+        flow_steps: int = 100,
+        reward_offset: float = 1.0
     ) -> None:
-    
-    # 1. 强制切换到 Eval 模式
     original_mode = policy.training
     policy.set_training_mode(False)
     
@@ -651,10 +735,14 @@ def collect_online_data(
     ]
     obs = env.reset()
     
-    total_collected_trajectories = 0
+    success_threshold = -reward_offset
+    succ_trajectories = 0
+    fail_trajectories = 0
+    total_collected = 0
     pbar = tqdm(total=num_trajectories, desc="Collecting Trajectories")
 
-    while total_collected_trajectories < num_trajectories:
+    # NOTE: here we make sure fail data should be collected for at least one trajectory
+    while fail_trajectories == 0 or total_collected < num_trajectories:
         noise = torch.randn(env.num_envs, chunk_size, action_dim, device=device)
         obs_tensor = torch.as_tensor(obs, device=device, dtype=torch.float32)
 
@@ -669,12 +757,7 @@ def collect_online_data(
 
             action_chunk = x.cpu().numpy()
             
-            # [Fix] 针对 Flatten Action Space 的 Clip 修复
             if hasattr(env, "action_space") and isinstance(env.action_space, spaces.Box):
-                # 报错显示 env.action_space.low 是 (28,) 而 action_chunk 是 (B, 4, 7)
-                # 我们需要把 low/high 变形成 (4, 7) 以便广播
-                
-                # 确保维度匹配，防止 reshape 错误
                 if env.action_space.low.shape[0] == chunk_size * action_dim:
                     low = env.action_space.low.reshape(chunk_size, action_dim)
                     high = env.action_space.high.reshape(chunk_size, action_dim)
@@ -702,12 +785,32 @@ def collect_online_data(
             traj["infos"].append(info[i])
 
             if done[i]:
-                if total_collected_trajectories < num_trajectories:
-                    added = _add_traj_to_buffer(traj=traj, buffer=buffer)
-                    if added:
-                        total_collected_trajectories += 1
-                        pbar.update(1)
+                is_succ = reward[i] > success_threshold
+                should_save = False
                 
+                if is_succ:
+                    if total_collected < num_trajectories or succ_trajectories == 0:
+                        should_save = True
+                        target_buffer = succ_buffer
+                else:
+                    if total_collected < num_trajectories or fail_trajectories == 0:
+                        should_save = True
+                        target_buffer = fail_buffer
+
+                if should_save:
+                    added = _add_traj_to_buffer(traj=traj, buffer=target_buffer)
+                    if added:
+                        total_collected += 1
+                        if is_succ:
+                            succ_trajectories += 1
+                        else:
+                            fail_trajectories += 1
+                        
+                        if total_collected <= num_trajectories:
+                            pbar.update(1)
+                        else:
+                            pbar.set_description(f"Searching for missing {'succ' if succ_trajectories==0 else 'fail'}...")
+
                 env_trajectories[i] = {
                     "obs": [], "next_obs": [], "actions": [],
                     "rewards": [], "dones": [], "infos": []
@@ -716,5 +819,94 @@ def collect_online_data(
         obs = next_obs
 
     pbar.close()
+    policy.set_training_mode(original_mode)
+
+
+def warmup_succ_buffer(
+        env: Union[GymEnv, str], 
+        succ_buffer: ReplayBuffer, 
+        num_trajectories: int, 
+        policy, 
+        chunk_size: int,
+        action_dim: int,
+        device,
+        flow_steps: int = 100,
+        reward_offset: float = 1.0
+    ) -> None:
+    """
+    Collects exactly 'num_trajectories' successful trajectories into succ_buffer.
+    """
+    original_mode = policy.training
+    policy.set_training_mode(False)
     
+    env_trajectories = [
+        {"obs": [], "next_obs": [], "actions": [], "rewards": [], "dones": [], "infos": []}
+        for _ in range(env.num_envs)
+    ]
+    obs = env.reset()
+    
+    success_threshold = -reward_offset
+    succ_trajectories = 0
+    
+    pbar = tqdm(total=num_trajectories, desc="Collecting Success Trajectories")
+    while succ_trajectories < num_trajectories:
+        noise = torch.randn(env.num_envs, chunk_size, action_dim, device=device)
+        obs_tensor = torch.as_tensor(obs, device=device, dtype=torch.float32)
+
+        with torch.no_grad():
+            x = noise
+            dt = 1.0 / flow_steps
+            for i in range(flow_steps):
+                t_val = i * dt
+                t_tensor = torch.full((env.num_envs,), t_val, device=device)
+                v_pred = policy(obs_tensor, x, t_tensor)
+                x = x + v_pred * dt
+
+            action_chunk = x.cpu().numpy()
+            
+            if hasattr(env, "action_space") and isinstance(env.action_space, spaces.Box):
+                if env.action_space.low.shape[0] == chunk_size * action_dim:
+                    low = env.action_space.low.reshape(chunk_size, action_dim)
+                    high = env.action_space.high.reshape(chunk_size, action_dim)
+                    action_chunk = np.clip(action_chunk, low, high)
+                else:
+                    try:
+                        action_chunk = np.clip(action_chunk, env.action_space.low, env.action_space.high)
+                    except ValueError:
+                        print(f"[Warning] Clip failed due to shape mismatch: Act {action_chunk.shape}, Low {env.action_space.low.shape}")
+
+        next_obs, reward, done, info = env.step(action_chunk)
+
+        for i in range(env.num_envs):
+            traj = env_trajectories[i]
+            real_next_obs = next_obs[i]
+            if done[i] and info[i] and "terminal_observation" in info[i]:
+                real_next_obs = info[i]["terminal_observation"]
+
+            traj["obs"].append(obs[i])
+            traj["next_obs"].append(real_next_obs)
+            traj["actions"].append(action_chunk[i])  
+            traj["rewards"].append(reward[i])
+            traj["dones"].append(done[i])
+            traj["infos"].append(info[i])
+
+            if done[i]:
+                is_succ = reward[i] > success_threshold
+                
+                # Only save if it is successful and we haven't reached the target count yet
+                if is_succ and succ_trajectories < num_trajectories:
+                    added = _add_traj_to_buffer(traj=traj, buffer=succ_buffer)
+                    if added:
+                        succ_trajectories += 1
+                        pbar.update(1)
+                
+                # Reset the temporary trajectory storage for this env regardless of success/fail
+                env_trajectories[i] = {
+                    "obs": [], "next_obs": [], "actions": [],
+                    "rewards": [], "dones": [], "infos": []
+                }
+
+        obs = next_obs
+
+    pbar.close()
     policy.set_training_mode(original_mode)
