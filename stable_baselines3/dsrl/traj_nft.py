@@ -183,7 +183,7 @@ class TrajNFT(OffPolicyAlgorithm):
             hidden_dim=256
         ).to(self.device)
 
-        self.policy_optimizer = torch.optim.Adam(self.policy.parameters(), lr=1e-4)
+        self.policy_optimizer = torch.optim.Adam(self.policy.parameters(), lr=3e-4)
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=1e-4)
         self.value_optimizer = torch.optim.Adam(self.value.parameters(), lr=1e-4)
         
@@ -646,6 +646,7 @@ class TrajNFT(OffPolicyAlgorithm):
 
         self.policy_optimizer.zero_grad()
         actor_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=1.0)
         self.policy_optimizer.step()
 
         # just for log
@@ -798,6 +799,12 @@ def collect_online_data(
                         target_buffer = fail_buffer
 
                 if should_save:
+                    # change all actions for fail buffer into noise
+                    if target_buffer == fail_buffer:
+                        for k in range(len(traj["actions"])):
+                            a = np.random.randn(*traj["actions"][k].shape)
+                            traj["actions"][k] = np.clip(a, -1, 1).astype(np.float32)
+
                     added = _add_traj_to_buffer(traj=traj, buffer=target_buffer)
                     if added:
                         total_collected += 1
