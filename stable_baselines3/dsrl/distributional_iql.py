@@ -16,20 +16,20 @@ from stable_baselines3.common.buffers import ReplayBuffer
 from stable_baselines3.common.noise import ActionNoise
 from stable_baselines3.common.off_policy_algorithm import OffPolicyAlgorithm
 from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
+from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback
 from stable_baselines3.common.utils import polyak_update, expectile_loss
 from stable_baselines3.sac.policies import SACPolicy
-from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
+from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback
 
 from stable_baselines3.sac.policies import SACPolicy
 from stable_baselines3.common.policies import BasePolicy
 
 from .networks import CriticNetwork, ValueNetwork
 
-SelfClean_IQL = TypeVar("SelfClean_IQL", bound="Clean_IQL")
+SelfDist_Q = TypeVar("SelfDist_Q", bound="Dist_Q")
 
 
-class Clean_IQL(OffPolicyAlgorithm):
+class Dist_Q(OffPolicyAlgorithm):
     """
     IQL (Implicit Q-Learning) Implementation.
     Includes Critic (Q), Value (V), and Actor (Policy) updates.
@@ -115,7 +115,7 @@ class Clean_IQL(OffPolicyAlgorithm):
             self._setup_model()
 
     def _setup_model(self) -> None:
-        super(Clean_IQL, self)._setup_model()   # here it will init self.policy (Actor)
+        super(Dist_Q, self)._setup_model()   # here it will init self.policy (Actor)
         features_extractor = self.policy.features_extractor if hasattr(self.policy, "features_extractor") else None
         
         self.critic = CriticNetwork(
@@ -267,7 +267,7 @@ class Clean_IQL(OffPolicyAlgorithm):
             )
 
     def learn(
-        self: SelfClean_IQL,
+        self: SelfDist_Q,
         iterations: int,
         callback: MaybeCallback = None,
         log_interval: int = 100,
@@ -276,7 +276,7 @@ class Clean_IQL(OffPolicyAlgorithm):
         progress_bar: bool = False,
         save_path: Optional[str] = None,
         total_save_num: int = 0,
-    ) -> SelfClean_IQL:
+    ) -> SelfDist_Q:
         """
         main entrance for IQL
         """
@@ -471,7 +471,7 @@ class Clean_IQL(OffPolicyAlgorithm):
         print_system_info: bool = False,
         force_reset: bool = True,
         **kwargs,
-    ) -> "Clean_IQL":
+    ) -> "Dist_Q":
         """
         Load the model from a zip/pkl file.
         """

@@ -8,7 +8,7 @@ from stable_baselines3.her.her_replay_buffer import HerReplayBuffer
 from stable_baselines3.ppo import PPO
 from stable_baselines3.sac import SAC
 from stable_baselines3.dsrl import DSRL, DSRL_Flow, FLOW
-from stable_baselines3.dsrl import DSRL_Flow
+from stable_baselines3.dsrl import Dist_Q
 from stable_baselines3.td3 import TD3
 
 # Read version from file
@@ -33,7 +33,7 @@ __all__ = [
     "DSRL",
     "DSRL_Flow",
     "FLOW",
-    "Clean_IQL",
+    "Dist_Q",
     "TD3",
     "HerReplayBuffer",
     "get_system_info",
