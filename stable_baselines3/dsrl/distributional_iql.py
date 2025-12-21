@@ -1,8 +1,10 @@
 import os
 import time
+import math
 import pathlib
 import numpy as np
 import torch
+import torch.nn as nn
 from collections import deque
 from gymnasium import spaces
 from torch.nn import functional as F
@@ -23,10 +25,63 @@ from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback
 
 from stable_baselines3.sac.policies import SACPolicy
 from stable_baselines3.common.policies import BasePolicy
-
 from .networks import CriticNetwork, ValueNetwork
 
 SelfDist_Q = TypeVar("SelfDist_Q", bound="Dist_Q")
+
+
+
+class HLGaussLoss(nn.Module):
+    """
+    Histogram Loss - Gaussian (HL-Gauss) for Distributional RL.
+
+    (gaoyuan) refer to Stop Regressing paper: https://arxiv.org/pdf/2403.03950
+    """
+    def __init__(self, min_value: float, max_value: float, num_bins: int, sigma_ratio: float = 0.75):
+        super().__init__()
+        self.min_value = min_value
+        self.max_value = max_value
+        self.num_bins = num_bins
+        self.sigma_ratio = sigma_ratio
+        
+        self.register_buffer(
+            "support_edges", 
+            torch.linspace(min_value, max_value, num_bins + 1)
+        )
+        
+        self.bin_width = (max_value - min_value) / num_bins
+        self.sigma = sigma_ratio * self.bin_width
+
+    def _transform_to_probs(self, target_scalar: torch.Tensor) -> torch.Tensor:
+        if target_scalar.ndim == 1:
+            target_scalar = target_scalar.unsqueeze(-1)
+
+        target = target_scalar.clamp(self.min_value, self.max_value)
+        normalized_x = (self.support_edges - target) / (self.sigma * math.sqrt(2))
+        cdf_evals = 0.5 * (1 + torch.erf(normalized_x))
+        bin_probs = cdf_evals[..., 1:] - cdf_evals[..., :-1]
+        z = cdf_evals[..., -1] - cdf_evals[..., 0]
+        bin_probs = bin_probs / (z.unsqueeze(-1) + 1e-6)
+        return bin_probs
+
+    def forward(self, logits: torch.Tensor, target_scalar: torch.Tensor, weights: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Computes Cross Entropy Loss.
+        If weights is provided, computes weighted mean loss (used for Expectile regression in V).
+        """
+        with torch.no_grad():
+            target_probs = self._transform_to_probs(target_scalar)
+
+        ce_loss = F.cross_entropy(logits, target_probs, reduction='none')
+        
+        if weights is not None:     # Ensure weights shape matches loss shape [Batch]
+            weights = weights.view(-1)
+            loss = (ce_loss * weights).mean()
+        else:
+            loss = ce_loss.mean()
+            
+        return loss
+
 
 
 class Dist_Q(OffPolicyAlgorithm):
@@ -44,7 +99,7 @@ class Dist_Q(OffPolicyAlgorithm):
     def __init__(
         self,
         env: Union[GymEnv, str],
-        policy: Union[str, Type[BasePolicy]] = SACPolicy, # 默认使用 SACPolicy
+        policy: Union[str, Type[BasePolicy]] = SACPolicy,
         learning_rate: float = 1e-4,
         buffer_size: int = 10_000_000,
         learning_starts: int = 1,
@@ -67,6 +122,10 @@ class Dist_Q(OffPolicyAlgorithm):
         device: Union[torch.device, str] = "auto",
         _init_setup_model: bool = True,
         max_episode_steps: int = 400,
+        num_bins: int = 101,
+        v_min: float = -10.0,
+        v_max: float = 60.0,
+        sigma_ratio: float = 0.75,  # be the same as original paper
     ):
         if policy_kwargs is None:
             policy_kwargs = {}
@@ -103,41 +162,63 @@ class Dist_Q(OffPolicyAlgorithm):
         self.expectile = expectile
         self.temperature = temperature
         self.critic_eta = critic_eta
-        self.buffer = buffer    # choose what buffer to use for offline RL
-
+        self.buffer = buffer
         self.max_episode_steps = max_episode_steps
-        self.env_buffers = None
-        self.submission_staging = None
 
+        self.num_bins = num_bins
+        self.v_min = v_min
+        self.v_max = v_max
+        self.sigma_ratio = sigma_ratio
+        
+        self.env_buffers = None
         self._n_updates = 0
         
         if _init_setup_model:
             self._setup_model()
 
     def _setup_model(self) -> None:
-        super(Dist_Q, self)._setup_model()   # here it will init self.policy (Actor)
+        # using the inner actor from `OffPolicyAlgorithm` class
+        super(Dist_Q, self)._setup_model()
         features_extractor = self.policy.features_extractor if hasattr(self.policy, "features_extractor") else None
         
+        # NOTE: distributional
         self.critic = CriticNetwork(
             self.observation_space,
             self.action_space,
             features_extractor=features_extractor,
-            net_arch=[256, 256]
+            net_arch=[256, 256],
+            num_bins=self.num_bins,
+            v_min=self.v_min,
+            v_max=self.v_max
         ).to(self.device)
         
         self.critic_target = CriticNetwork(
             self.observation_space,
             self.action_space,
             features_extractor=features_extractor,
-            net_arch=[256, 256]
+            net_arch=[256, 256],
+            num_bins=self.num_bins,
+            v_min=self.v_min,
+            v_max=self.v_max
         ).to(self.device)
         
         self.critic_target.load_state_dict(self.critic.state_dict())
         self.critic_target.set_training_mode(False)
 
+        # NOTE: distributional
         self.value = ValueNetwork(
             self.observation_space, 
-            hidden_dim=256
+            hidden_dim=256,
+            num_bins=self.num_bins,
+            v_min=self.v_min,
+            v_max=self.v_max
+        ).to(self.device)
+
+        self.hl_gauss_loss = HLGaussLoss(
+            min_value=self.v_min, 
+            max_value=self.v_max, 
+            num_bins=self.num_bins, 
+            sigma_ratio=self.sigma_ratio
         ).to(self.device)
 
         self.actor_optimizer = torch.optim.Adam(self.policy.actor.parameters(), lr=1e-4)
@@ -190,7 +271,7 @@ class Dist_Q(OffPolicyAlgorithm):
         target_buffer: ReplayBuffer,
         prefix: str = "success_data",
         size: int = 2000,
-        use_01_reward: bool = False,
+        use_01_reward: bool = True,
         reward_offset: int = 1,
         truncate_last_traj: bool = True,
         verbose: int = 1,
@@ -343,12 +424,6 @@ class Dist_Q(OffPolicyAlgorithm):
         return self
 
     def _train_iql_step(self, buffer: ReplayBuffer, batch_size: int) -> None:
-        """
-        One step of IQL:
-        1. Update Value (V) via Expectile Regression.
-        2. Update Critic (Q) via MSE.
-        3. Update Actor (Policy) via Advantage Weighted Regression (AWR).
-        """
         replay_data = buffer.sample(batch_size, env=self._vec_normalize_env)
         obs = replay_data.observations
         actions = replay_data.actions
@@ -356,35 +431,47 @@ class Dist_Q(OffPolicyAlgorithm):
         rewards = replay_data.rewards
         dones = replay_data.dones
 
-        # STEP-1: value expectile loss
+        # Update Value (V) Distribution
         with torch.no_grad():
-            target_q1, target_q2 = self.critic_target(obs, actions)
-            target_q = torch.min(target_q1, target_q2)
+            target_q1_mean, target_q2_mean = self.critic_target.get_q_mean(obs, actions)    # scaler outputs
+            target_q_mean = torch.min(target_q1_mean, target_q2_mean)
+            v_mean = self.value.get_v_mean(obs)     # scaler outputs
+            
+            diff = target_q_mean - v_mean
+            weights = torch.where(diff > 0, self.expectile, 1 - self.expectile)
 
-        v_pred = self.value(obs)
-        v_loss = expectile_loss(target_q - v_pred, self.expectile).mean()
+        v_logits = self.value(obs)
+        v_loss = self.hl_gauss_loss(v_logits, target_q_mean, weights)
 
         self.value_optimizer.zero_grad()
         v_loss.backward()
         self.value_optimizer.step()
 
+        # Update Critic (Q) Distribution
         with torch.no_grad():
-            next_v = self.value(next_obs)
-            target_q_values = rewards + (1 - dones) * self.gamma * next_v
+            # use the MEAN of the updated V distribution.
+            next_v_mean = self.value.get_v_mean(next_obs)
+            target_q_scalar = rewards + (1 - dones) * self.gamma * next_v_mean
 
-        # STEP-2: crirtic MSE
-        current_q1, current_q2 = self.critic(obs, actions)
-        critic_loss = F.mse_loss(current_q1, target_q_values) + F.mse_loss(current_q2, target_q_values)
+        current_q1_logits, current_q2_logits = self.critic(obs, actions)
+        
+        loss_q1 = self.hl_gauss_loss(current_q1_logits, target_q_scalar)
+        loss_q2 = self.hl_gauss_loss(current_q2_logits, target_q_scalar)
+        critic_loss = loss_q1 + loss_q2
 
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
         self.critic_optimizer.step()
         
-        # STEP-3: AWM-like update actor
-        advantage = target_q - v_pred
-        exp_adv = torch.exp(self.temperature * advantage.detach()).clamp(max=100.0)
+        # Update Actor (Policy)
+        with torch.no_grad():
+             current_q1_mean, current_q2_mean = self.critic.get_q_mean(obs, actions)    # use mean, same as original IQL
+             current_q_mean = torch.min(current_q1_mean, current_q2_mean)
+             v_mean_detached = self.value.get_v_mean(obs).detach()
         
-        # NOTE(gaoyuan) for SACPolicy, evaluate_actions returns log_prob, entropy, distribution
+        advantage = current_q_mean - v_mean_detached
+        exp_adv = torch.exp(self.temperature * advantage).clamp(max=100.0)
+        
         mean_actions, log_std, kwargs = self.policy.actor.get_action_dist_params(obs)
         dist = self.policy.actor.action_dist.proba_distribution(mean_actions, log_std)
         log_prob = dist.log_prob(actions)
@@ -403,10 +490,17 @@ class Dist_Q(OffPolicyAlgorithm):
         self.logger.record("train/value_loss", v_loss.item())
         self.logger.record("train/critic_loss", critic_loss.item())
         self.logger.record("train/actor_loss", actor_loss.item())
-        self.logger.record("train/v_pred_mean", v_pred.mean().item())
-        self.logger.record("train/q_target_mean", target_q_values.mean().item())
+        self.logger.record("train/q_target_mean", target_q_scalar.mean().item())
         self.logger.record("train/advantage_mean", advantage.mean().item())
-        self.logger.record("train/log_prob_mean", log_prob.mean().item())
+
+    def get_q_value(self, observation: np.ndarray, action: np.ndarray) -> np.ndarray:
+        self.critic.eval()
+        with torch.no_grad():
+            obs_tensor = torch.as_tensor(observation, device=self.device)
+            act_tensor = torch.as_tensor(action, device=self.device)
+            q1_mean, q2_mean = self.critic.get_q_mean(obs_tensor, act_tensor)
+            q_min = torch.min(q1_mean, q2_mean)
+        return q_min.cpu().numpy()
     
     # def predict(
     #     self,
@@ -438,63 +532,32 @@ class Dist_Q(OffPolicyAlgorithm):
             q_min = torch.min(q1, q2)
         return q_min.cpu().numpy()
 
-    def save(
-        self,
-        path: Union[str, pathlib.Path, int],
-        exclude: Optional[List[str]] = None,
-        include: Optional[List[str]] = None,
-    ) -> None:
-        """
-        Save the model (Critic, Value, and Policy).
-        """
+    def save(self, path: Union[str, pathlib.Path, int], **kwargs) -> None:
         data = {
             "critic_state_dict": self.critic.state_dict(),
             "critic_target_state_dict": self.critic_target.state_dict(),
             "value_state_dict": self.value.state_dict(),
-            "policy_state_dict": self.policy.state_dict(), # Added Policy
+            "policy_state_dict": self.policy.state_dict(),
             "critic_optimizer_state_dict": self.critic_optimizer.state_dict(),
             "value_optimizer_state_dict": self.value_optimizer.state_dict(),
-            "policy_optimizer_state_dict": self.actor_optimizer.state_dict(), # Added Policy Optimizer
-            "pytorch_variables": {},
+            "policy_optimizer_state_dict": self.actor_optimizer.state_dict(),
         }
-        
         save_to_pkl(path, data, verbose=self.verbose)
-        print(f"[Clean_IQL] Model saved to {path}")
 
     @classmethod
-    def load(
-        cls,
-        path: Union[str, pathlib.Path, int],
-        env: Optional[GymEnv] = None,
-        device: Union[torch.device, str] = "auto",
-        custom_objects: Optional[Dict[str, Any]] = None,
-        print_system_info: bool = False,
-        force_reset: bool = True,
-        **kwargs,
-    ) -> "Dist_Q":
-        """
-        Load the model from a zip/pkl file.
-        """
-        # (gaoyuan) Fix: `save` method only saves a dict, not a tuple
+    def load(cls, path, env=None, device="auto", **kwargs):
         loaded_object = load_from_pkl(path, verbose=False)
-
         if isinstance(loaded_object, dict):
             data = loaded_object
-        elif isinstance(loaded_object, tuple):
-             data, params, pytorch_variables = loaded_object[:3]
         else:
-            raise ValueError(f"Unknown format loaded from {path}: {type(loaded_object)}")
-
+             data = loaded_object[0] # assuming tuple
         model = cls(env=env, device=device, _init_setup_model=True, **kwargs)
-
-        # 1. Load Critic & Target
         if "critic_state_dict" in data:
             model.critic.load_state_dict(data["critic_state_dict"])
             model.critic_target.load_state_dict(data["critic_target_state_dict"])
-        
-        # 2. Load Value
         if "value_state_dict" in data:
             model.value.load_state_dict(data["value_state_dict"])
-
-        print(f"[Clean_IQL] Model loaded from {path}")
+        if "policy_state_dict" in data:
+            model.policy.load_state_dict(data["policy_state_dict"])
         return model
+    

@@ -2,13 +2,14 @@ import math
 from gymnasium import spaces
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from typing import Callable, Tuple, List, Type
 from dataclasses import dataclass 
 
 from stable_baselines3.common.policies import BasePolicy
 from stable_baselines3.common.policies import ContinuousCritic
-from stable_baselines3.common.torch_layers import FlattenExtractor
+from stable_baselines3.common.torch_layers import FlattenExtractor, create_mlp
 
 
 def linear_schedule(initial_value: float):
@@ -119,16 +120,24 @@ class FlowPolicy(BasePolicy):
 
 class ValueNetwork(nn.Module):
     """
-    V-Network for IQL (Expectile Regression).
-    Estimates V(s).
+    Distributional V-Network for IQL.
+    Estimates V(s) as a categorical distribution.
+    Output: Logits of shape (Batch, num_bins)
     """
     def __init__(
         self, 
         observation_space: spaces.Space, 
         hidden_dim: int = 256, 
-        depth: int = 3
+        depth: int = 3,
+        num_bins: int = 51,
+        v_min: float = 0.0,
+        v_max: float = 1.0
     ):
         super().__init__()
+        self.num_bins = num_bins
+        self.v_min = v_min
+        self.v_max = v_max
+        
         # Handle observation dimension (assuming Box/Flat for now)
         if isinstance(observation_space, spaces.Box):
             input_dim = int(np.prod(observation_space.shape))
@@ -143,21 +152,45 @@ class ValueNetwork(nn.Module):
             layers.append(nn.Linear(hidden_dim, hidden_dim))
             layers.append(nn.ReLU())
             
-        layers.append(nn.Linear(hidden_dim, 1))
+        # Output logits for num_bins
+        layers.append(nn.Linear(hidden_dim, num_bins))
         
         self.net = nn.Sequential(*layers)
+        
+        # Register support vector for calculating mean
+        edges = torch.linspace(v_min, v_max, num_bins + 1)
+        centers = (edges[:-1] + edges[1:]) / 2
+        self.register_buffer("support", centers)
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        """
+        Returns raw LOGITS for V(s).
+        Shape: (Batch, num_bins)
+        """
         return self.net(obs)
+    
+    def get_probs(self, obs: torch.Tensor) -> torch.Tensor:
+        """
+        Returns probabilities (softmax of logits).
+        """
+        logits = self.forward(obs)
+        return F.softmax(logits, dim=-1)
+
+    def get_v_mean(self, obs: torch.Tensor) -> torch.Tensor:
+        """
+        Returns scalar mean of the distribution: E[V] = sum(p_i * z_i).
+        Shape: (Batch, 1)
+        """
+        probs = self.get_probs(obs)
+        return torch.sum(probs * self.support, dim=-1, keepdim=True)
 
 
 class CriticNetwork(ContinuousCritic):
     """
-    Q-Network for IQL.
-    Inherits from SB3 ContinuousCritic to leverage Double-Q logic 
-    and feature extraction support.
+    Distributional Q-Network for IQL (HL-Gauss).
+    Outputs LOGITS for categorical distribution bins.
     
-    Default Architecture: [256, 256]
+    Architecture: [256, 256] -> num_bins
     """
     def __init__(
         self,
@@ -169,7 +202,14 @@ class CriticNetwork(ContinuousCritic):
         activation_fn: Type[nn.Module] = nn.GELU,
         normalize_images: bool = True,
         share_features_extractor: bool = True,
+        num_bins: int = 51,
+        v_min: float = 0.0,
+        v_max: float = 1.0,
     ):
+        self.num_bins = num_bins
+        self.v_min = v_min
+        self.v_max = v_max
+        
         if features_extractor is None:
             features_extractor = FlattenExtractor(observation_space)
 
@@ -186,3 +226,49 @@ class CriticNetwork(ContinuousCritic):
             normalize_images=normalize_images,
             share_features_extractor=share_features_extractor,
         )
+        
+        # Re-define q_networks to have `num_bins` output instead of 1
+        action_dim = int(np.prod(action_space.shape))
+        self.q_networks = []
+        for _ in range(self.n_critics):
+            q_net_layers = create_mlp(
+                input_dim=features_dim + action_dim, 
+                output_dim=num_bins,
+                net_arch=net_arch, 
+                activation_fn=activation_fn
+            )
+            q_net = nn.Sequential(*q_net_layers)  # 必须封装成 Module
+            
+            self.q_networks.append(q_net)
+        
+        self.q_networks = nn.ModuleList(self.q_networks)
+        
+        # Register support vector for calculating mean
+        edges = torch.linspace(v_min, v_max, num_bins + 1)
+        centers = (edges[:-1] + edges[1:]) / 2
+        self.register_buffer("support", centers)
+
+    def forward(self, obs: torch.Tensor, actions: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+        """
+        Returns raw LOGITS for all critics.
+        Output Shape: (Batch, num_bins) per critic
+        """
+        with torch.set_grad_enabled(not self.share_features_extractor):
+            features = self.extract_features(obs, self.features_extractor)
+            
+        qvalue_input = torch.cat([features, actions], dim=1)
+        return tuple(q_net(qvalue_input) for q_net in self.q_networks)
+
+    def get_probs(self, obs: torch.Tensor, actions: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+        """
+        Returns probabilities (softmax of logits).
+        """
+        logits_tuple = self.forward(obs, actions)
+        return tuple(F.softmax(logits, dim=-1) for logits in logits_tuple)
+
+    def get_q_mean(self, obs: torch.Tensor, actions: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+        """
+        Returns scalar mean of the distribution: E[Q] = sum(p_i * z_i).
+        """
+        probs_tuple = self.get_probs(obs, actions)
+        return tuple(torch.sum(probs * self.support, dim=-1, keepdim=True) for probs in probs_tuple)
