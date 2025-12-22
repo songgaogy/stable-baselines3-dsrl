@@ -7,7 +7,7 @@ from stable_baselines3.dqn import DQN
 from stable_baselines3.her.her_replay_buffer import HerReplayBuffer
 from stable_baselines3.ppo import PPO
 from stable_baselines3.sac import SAC
-from stable_baselines3.dsrl import DSRL, FLOW, TrajNFT
+from stable_baselines3.dsrl import DSRL, FLOW, NFT_BC
 from stable_baselines3.td3 import TD3
 
 # Read version from file
@@ -32,7 +32,7 @@ __all__ = [
     "DSRL",
     "FLOW",
     "TD3",
-    "TrajNFT",
+    "NFT_BC",
     "HerReplayBuffer",
     "get_system_info",
 ]
